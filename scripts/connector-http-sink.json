@@ -1,0 +1,14 @@
+{
+  "name": "ol-http-sink",
+  "config": {
+    "connector.class": "HttpSink",
+    "name": "ol-http-sink",
+    "kafka.api.key": "QH6SK7TQVTSJVOJK",
+    "kafka.api.secret": "cfltdEpLs84yib9Azbf+Gx/RmXvUOeWcAMpV+Dutni9HZ23V0i26wAKj8AY7/zCg",
+    "topics": "ol-orders-enriched",
+    "input.data.format": "AVRO",
+    "http.api.url": "https://httpbin.org/post",
+    "auth.type": "NONE",
+    "tasks.max": "1"
+  }
+}

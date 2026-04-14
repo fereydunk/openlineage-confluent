@@ -1,0 +1,15 @@
+{
+  "type": "record",
+  "name": "orders_enriched",
+  "namespace": "io.confluent.openlineage",
+  "fields": [
+    {"name": "ordertime",  "type": "long"},
+    {"name": "orderid",    "type": "int"},
+    {"name": "itemid",     "type": "string"},
+    {"name": "orderunits", "type": "double"},
+    {"name": "city",       "type": "string"},
+    {"name": "state",      "type": "string"},
+    {"name": "zipcode",    "type": "long"},
+    {"name": "risk_tier",  "type": "string"}
+  ]
+}

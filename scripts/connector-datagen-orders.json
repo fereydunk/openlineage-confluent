@@ -1,0 +1,14 @@
+{
+  "name": "ol-datagen-orders-source",
+  "config": {
+    "connector.class": "DatagenSource",
+    "name": "ol-datagen-orders-source",
+    "kafka.api.key": "QH6SK7TQVTSJVOJK",
+    "kafka.api.secret": "cfltdEpLs84yib9Azbf+Gx/RmXvUOeWcAMpV+Dutni9HZ23V0i26wAKj8AY7/zCg",
+    "kafka.topic": "ol-raw-orders",
+    "output.data.format": "AVRO",
+    "quickstart": "ORDERS",
+    "max.interval": "1000",
+    "tasks.max": "1"
+  }
+}

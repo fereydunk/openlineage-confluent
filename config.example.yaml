@@ -1,0 +1,46 @@
+# openlineage-confluent — example configuration
+# Copy to config.yaml and fill in your values.
+# All keys can also be set as environment variables (see names below).
+
+confluent:
+  # Cloud-level API key (api.confluent.cloud — NOT Schema Registry or Kafka scoped)
+  # Create under: Confluent Cloud → API Keys → Add key → Cloud resource management
+  CONFLUENT_CLOUD_API_KEY:    "XXXXXXXXXXXXXXXX"
+  CONFLUENT_CLOUD_API_SECRET: "your-cloud-api-secret-here"
+
+  # Confluent Cloud environment and Kafka cluster IDs
+  # Found under: Confluent Cloud → Environments → <your-env> → Cluster settings
+  CONFLUENT_ENV_ID:     "env-xxxxxx"
+  CONFLUENT_CLUSTER_ID: "lkc-xxxxxx"
+
+  # Regional Flink REST endpoint
+  # Found under: Confluent Cloud → Flink → Compute pools → REST endpoint
+  # The bridge uses the Confluent CLI (not this URL directly) for Flink statement listing,
+  # but the URL is stored for future direct REST access.
+  CONFLUENT_FLINK_REST_URL: "https://flink.<region>.aws.confluent.cloud"
+
+openlineage:
+  # Transport: "http" → POST to backend | "console" → print to stdout (debug)
+  OPENLINEAGE_TRANSPORT: "http"
+
+  # OpenLineage backend URL
+  # Marquez default: http://localhost:5000
+  # DataHub:         http://localhost:8080
+  OPENLINEAGE_URL: "http://localhost:5000"
+
+  # Optional: API key if your backend requires auth
+  # OPENLINEAGE_API_KEY: "your-backend-api-key"
+
+  # Kafka bootstrap — used as the namespace for all topic Datasets
+  # Found under: Confluent Cloud → Cluster → Cluster settings → Bootstrap servers
+  OPENLINEAGE_KAFKA_BOOTSTRAP: "pkc-xxxxxx.<region>.aws.confluent.cloud:9092"
+
+  OPENLINEAGE_PRODUCER: "openlineage-confluent/0.1.0"
+
+pipeline:
+  # How often to poll Confluent Cloud for lineage changes (seconds)
+  PIPELINE_POLL_INTERVAL: 60
+
+  # If true, re-emit all events every cycle even if lineage hasn't changed.
+  # Useful after a backend restart. Default: false (diff-only).
+  PIPELINE_FULL_REFRESH: false

@@ -1,0 +1,177 @@
+{
+  "baseEntityGuid": "topic-orders-guid",
+  "lineageDirection": "BOTH",
+  "lineageDepth": 3,
+  "guidEntityMap": {
+    "topic-orders-guid": {
+      "guid": "topic-orders-guid",
+      "typeName": "kafka_topic",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "orders",
+        "qualifiedName": "lkc-abc123:orders",
+        "description": "Raw order events"
+      },
+      "relationshipAttributes": {}
+    },
+    "topic-orders-enriched-guid": {
+      "guid": "topic-orders-enriched-guid",
+      "typeName": "kafka_topic",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "orders-enriched",
+        "qualifiedName": "lkc-abc123:orders-enriched",
+        "description": "Enriched order events with customer info"
+      },
+      "relationshipAttributes": {}
+    },
+    "topic-orders-dlq-guid": {
+      "guid": "topic-orders-dlq-guid",
+      "typeName": "kafka_topic",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "orders-dlq",
+        "qualifiedName": "lkc-abc123:orders-dlq",
+        "description": "Dead letter queue for failed order events"
+      },
+      "relationshipAttributes": {}
+    },
+    "topic-customers-guid": {
+      "guid": "topic-customers-guid",
+      "typeName": "kafka_topic",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "customers",
+        "qualifiedName": "lkc-abc123:customers"
+      },
+      "relationshipAttributes": {}
+    },
+    "topic-order-summary-guid": {
+      "guid": "topic-order-summary-guid",
+      "typeName": "kafka_topic",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "order-summary",
+        "qualifiedName": "lkc-abc123:order-summary"
+      },
+      "relationshipAttributes": {}
+    },
+    "connector-source-pg-guid": {
+      "guid": "connector-source-pg-guid",
+      "typeName": "kafka_connect_connector",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "postgres-orders-source",
+        "qualifiedName": "lkc-abc123:postgres-orders-source",
+        "description": "CDC connector from Postgres orders table",
+        "owner": "data-engineering"
+      },
+      "relationshipAttributes": {}
+    },
+    "connector-sink-s3-guid": {
+      "guid": "connector-sink-s3-guid",
+      "typeName": "kafka_connect_sink",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "s3-orders-sink",
+        "qualifiedName": "lkc-abc123:s3-orders-sink",
+        "description": "Sink enriched orders to S3 data lake",
+        "owner": "data-engineering"
+      },
+      "relationshipAttributes": {}
+    },
+    "ksql-enrich-stream-guid": {
+      "guid": "ksql-enrich-stream-guid",
+      "typeName": "ksql_stream",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "ENRICH_ORDERS",
+        "qualifiedName": "lksqlc-xyz789:ENRICH_ORDERS",
+        "description": "Stream join: orders ⋈ customers",
+        "owner": "analytics-team"
+      },
+      "relationshipAttributes": {}
+    },
+    "ksql-order-summary-table-guid": {
+      "guid": "ksql-order-summary-table-guid",
+      "typeName": "ksql_table",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "ORDER_SUMMARY",
+        "qualifiedName": "lksqlc-xyz789:ORDER_SUMMARY",
+        "description": "Aggregated order counts per customer",
+        "owner": "analytics-team",
+        "columns": [
+          {"name": "customer_id", "type": "STRING"},
+          {"name": "order_count",  "type": "BIGINT"},
+          {"name": "total_amount", "type": "DOUBLE"}
+        ]
+      },
+      "relationshipAttributes": {}
+    },
+    "flink-fraud-detection-guid": {
+      "guid": "flink-fraud-detection-guid",
+      "typeName": "flink_job",
+      "status": "ACTIVE",
+      "attributes": {
+        "name": "fraud-detection-v2",
+        "qualifiedName": "env-abc123:fraud-detection-v2",
+        "description": "Real-time fraud scoring on order stream",
+        "owner": "risk-team"
+      },
+      "relationshipAttributes": {}
+    }
+  },
+  "relations": [
+    {
+      "fromEntityId": "connector-source-pg-guid",
+      "toEntityId":   "topic-orders-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "topic-orders-guid",
+      "toEntityId":   "ksql-enrich-stream-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "topic-customers-guid",
+      "toEntityId":   "ksql-enrich-stream-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "ksql-enrich-stream-guid",
+      "toEntityId":   "topic-orders-enriched-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "topic-orders-enriched-guid",
+      "toEntityId":   "connector-sink-s3-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "connector-sink-s3-guid",
+      "toEntityId":   "topic-orders-dlq-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "topic-orders-enriched-guid",
+      "toEntityId":   "ksql-order-summary-table-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "ksql-order-summary-table-guid",
+      "toEntityId":   "topic-order-summary-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "topic-orders-guid",
+      "toEntityId":   "flink-fraud-detection-guid",
+      "relationshipType": "LINEAGE"
+    },
+    {
+      "fromEntityId": "flink-fraud-detection-guid",
+      "toEntityId":   "topic-orders-enriched-guid",
+      "relationshipType": "LINEAGE"
+    }
+  ]
+}

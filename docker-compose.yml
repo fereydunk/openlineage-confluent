@@ -1,0 +1,62 @@
+services:
+
+  # ─── PostgreSQL (Marquez backend) ──────────────────────────────────────────
+  marquez-db:
+    image: postgres:14
+    container_name: marquez-db
+    environment:
+      POSTGRES_USER:     marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB:       marquez
+    volumes:
+      - marquez-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "marquez"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── Marquez API (OpenLineage ingest + query) ───────────────────────────────
+  #   OpenLineage events  →  POST http://localhost:5000/api/v1/lineage
+  #   Marquez REST API    →  http://localhost:5000/api/v1/...
+  marquez-api:
+    image: marquezproject/marquez:latest
+    container_name: marquez-api
+    depends_on:
+      marquez-db:
+        condition: service_healthy
+    environment:
+      # Dropwizard substitutes these into marquez.dev.yml
+      POSTGRES_HOST:    marquez-db
+      POSTGRES_PORT:    5432
+      MARQUEZ_PORT:     5000
+      MARQUEZ_ADMIN_PORT: 5001
+      # Disable OpenSearch — we don't run it
+      SEARCH_ENABLED:   "false"
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/api/v1/namespaces"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ─── Marquez Web UI ─────────────────────────────────────────────────────────
+  #   Open  →  http://localhost:3000
+  marquez-web:
+    image: marquezproject/marquez-web:latest
+    container_name: marquez-ui
+    depends_on:
+      marquez-api:
+        condition: service_healthy
+    environment:
+      MARQUEZ_HOST: marquez-api
+      MARQUEZ_PORT: 5000
+      WEB_PORT:     3000
+    ports:
+      - "3000:3000"
+
+volumes:
+  marquez-db-data:
