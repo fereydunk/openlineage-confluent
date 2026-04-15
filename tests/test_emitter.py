@@ -1,4 +1,4 @@
-"""Tests for LineageEmitter diff-tracking, removal-detection, and state persistence."""
+"""Tests for LineageEmitter — diff-tracking, removal detection, parallel emission."""
 
 from __future__ import annotations
 
@@ -11,15 +11,19 @@ import pytest
 from openlineage.client.event_v2 import InputDataset, Job, OutputDataset, Run, RunEvent, RunState
 
 from openlineage_confluent.emitter.emitter import LineageEmitter, _event_fingerprint
+from openlineage_confluent.emitter.state_store import StateStore
 
 
-@pytest.fixture()
-def state_file(tmp_path: Path) -> Path:
-    return tmp_path / "state.json"
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _make_store(tmp_path: Path) -> StateStore:
+    return StateStore(tmp_path / "state.db")
 
 
-def _make_emitter(ol_cfg, state_file: Path) -> LineageEmitter:
-    return LineageEmitter(ol_cfg, state_file=state_file)
+def _make_emitter(ol_cfg, tmp_path: Path, *, max_workers: int = 1) -> LineageEmitter:
+    """Create an emitter backed by a temp SQLite store. max_workers=1 keeps
+    tests deterministic; raise it in tests that specifically exercise parallelism."""
+    return LineageEmitter(ol_cfg, state_store=_make_store(tmp_path), max_workers=max_workers)
 
 
 def _make_event(
@@ -55,35 +59,35 @@ def test_fingerprint_differs_when_outputs_change() -> None:
 
 # ── Single emit ────────────────────────────────────────────────────────────────
 
-def test_emit_sends_event(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_emit_sends_event(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     assert emitter.emit(_make_event("job-a", ["in"], ["out"]), force=True) is True
 
 
-def test_emit_skips_unchanged_on_second_call(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_emit_skips_unchanged_on_second_call(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event = _make_event("job-b", ["in"], ["out"])
     emitter.emit(event, force=True)
     assert emitter.emit(event) is False
 
 
-def test_emit_resends_after_lineage_change(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_emit_resends_after_lineage_change(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     emitter.emit(_make_event("job-c", ["in"], ["out-old"]), force=True)
     assert emitter.emit(_make_event("job-c", ["in"], ["out-new"])) is True
 
 
 # ── Batch emit ─────────────────────────────────────────────────────────────────
 
-def test_emit_batch_returns_counts(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_emit_batch_returns_counts(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     events = [_make_event("job-x", ["in"], ["out"]), _make_event("job-y", ["a"], ["b"])]
     emitted, skipped, removed = emitter.emit_batch(events, force=True)
     assert emitted == 2 and skipped == 0 and removed == 0
 
 
-def test_emit_batch_skips_unchanged_on_second_batch(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_emit_batch_skips_unchanged_on_second_batch(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     events = [_make_event("job-z", ["in"], ["out"])]
     emitter.emit_batch(events, force=True)
     emitted, skipped, removed = emitter.emit_batch(events)
@@ -92,8 +96,8 @@ def test_emit_batch_skips_unchanged_on_second_batch(ol_cfg, state_file) -> None:
 
 # ── Removal detection ──────────────────────────────────────────────────────────
 
-def test_removal_detected_when_job_disappears(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_removal_detected_when_job_disappears(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event_a = _make_event("job-a", ["in"], ["out"])
     event_b = _make_event("job-b", ["in"], ["out"])
 
@@ -104,9 +108,8 @@ def test_removal_detected_when_job_disappears(ol_cfg, state_file) -> None:
     assert emitted == 0 and skipped == 1
 
 
-def test_removal_sends_abort_event(ol_cfg, state_file) -> None:
-    """The ABORT event must actually be dispatched to the backend."""
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_removal_sends_abort_event(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event_a = _make_event("job-a", ["in"], ["out"])
     event_b = _make_event("job-b", ["in"], ["out"])
 
@@ -121,8 +124,8 @@ def test_removal_sends_abort_event(ol_cfg, state_file) -> None:
     assert abort_event.job.name == "job-b"
 
 
-def test_removed_job_not_reported_again_next_cycle(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_removed_job_not_reported_again_next_cycle(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event_a = _make_event("job-a", ["in"], ["out"])
     event_b = _make_event("job-b", ["in"], ["out"])
 
@@ -133,9 +136,8 @@ def test_removed_job_not_reported_again_next_cycle(ol_cfg, state_file) -> None:
     assert removed == 0
 
 
-def test_removed_job_can_rejoin(ol_cfg, state_file) -> None:
-    """A job that disappears and reappears should be re-emitted normally."""
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_removed_job_can_rejoin(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event_a = _make_event("job-a", ["in"], ["out"])
     event_b = _make_event("job-b", ["in"], ["out"])
 
@@ -146,9 +148,8 @@ def test_removed_job_can_rejoin(ol_cfg, state_file) -> None:
     assert emitted == 1 and removed == 0
 
 
-def test_removal_preserves_namespace(ol_cfg, state_file) -> None:
-    """The ABORT event must carry the correct job namespace."""
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_removal_preserves_namespace(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     flink_event   = _make_event("ol-enrich-orders", ["raw"], ["enriched"],
                                 namespace="flink://env-m2qxq")
     connect_event = _make_event("ol-http-sink", ["enriched"], [],
@@ -164,61 +165,85 @@ def test_removal_preserves_namespace(ol_cfg, state_file) -> None:
     assert abort_event.job.name == "ol-http-sink"
 
 
-# ── State persistence ──────────────────────────────────────────────────────────
+# ── State persistence (SQLite) ─────────────────────────────────────────────────
 
-def test_state_file_written_after_batch(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_state_db_written_after_batch(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     emitter.emit_batch([_make_event("job-a", ["in"], ["out"])], force=True)
-    assert state_file.exists()
+    assert (tmp_path / "state.db").exists()
 
 
-def test_state_survives_process_restart(ol_cfg, state_file) -> None:
-    """A new emitter instance loading saved state detects removals correctly."""
+def test_state_survives_process_restart(ol_cfg, tmp_path) -> None:
+    """Removal detected across two separate emitter instances (simulated restart)."""
     event_a = _make_event("job-a", ["in"], ["out"])
     event_b = _make_event("job-b", ["in"], ["out"])
 
-    # "Process 1" — seeds state and exits
-    _make_emitter(ol_cfg, state_file).emit_batch([event_a, event_b], force=True)
+    # "Process 1"
+    _make_emitter(ol_cfg, tmp_path).emit_batch([event_a, event_b], force=True)
 
-    # "Process 2" — fresh instance, loads state, job-b is gone
-    emitter2 = _make_emitter(ol_cfg, state_file)
+    # "Process 2" — loads state from disk, job-b is gone
+    emitter2 = _make_emitter(ol_cfg, tmp_path)
     emitted, skipped, removed = emitter2.emit_batch([event_a])
     assert removed == 1
 
 
-def test_fingerprints_survive_restart(ol_cfg, state_file) -> None:
+def test_fingerprints_survive_restart(ol_cfg, tmp_path) -> None:
     """Unchanged jobs are still skipped after a process restart."""
     event = _make_event("job-a", ["in"], ["out"])
 
-    _make_emitter(ol_cfg, state_file).emit_batch([event], force=True)
+    _make_emitter(ol_cfg, tmp_path).emit_batch([event], force=True)
 
-    emitter2 = _make_emitter(ol_cfg, state_file)
+    emitter2 = _make_emitter(ol_cfg, tmp_path)
     emitted, skipped, removed = emitter2.emit_batch([event])
     assert emitted == 0 and skipped == 1
 
 
-def test_corrupt_state_file_starts_fresh(ol_cfg, state_file) -> None:
-    """A corrupt state file should not crash — just start with empty state."""
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text("not valid json {{{")
+def test_corrupt_state_db_starts_fresh(ol_cfg, tmp_path) -> None:
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"not a sqlite database !!!!")
 
-    emitter = _make_emitter(ol_cfg, state_file)
+    store = StateStore(db_path)
+    emitter = LineageEmitter(ol_cfg, state_store=store, max_workers=1)
     assert emitter._known_jobs == {}
+
+
+# ── Parallel emission ──────────────────────────────────────────────────────────
+
+def test_parallel_emission_all_events_sent(ol_cfg, tmp_path) -> None:
+    """With max_workers > 1 all events are still emitted exactly once."""
+    emitter = _make_emitter(ol_cfg, tmp_path, max_workers=4)
+    events = [_make_event(f"job-{i}", ["in"], ["out"]) for i in range(20)]
+
+    with patch.object(emitter._client, "emit") as mock_emit:
+        emitted, skipped, removed = emitter.emit_batch(events, force=True)
+
+    assert emitted == 20
+    assert mock_emit.call_count == 20
+
+
+def test_parallel_emission_skips_unchanged(ol_cfg, tmp_path) -> None:
+    """Unchanged events are correctly skipped even under concurrent workers."""
+    emitter = _make_emitter(ol_cfg, tmp_path, max_workers=4)
+    events = [_make_event(f"job-{i}", ["in"], ["out"]) for i in range(10)]
+
+    emitter.emit_batch(events, force=True)
+    emitted, skipped, removed = emitter.emit_batch(events)
+
+    assert emitted == 0 and skipped == 10 and removed == 0
 
 
 # ── Reset state ────────────────────────────────────────────────────────────────
 
-def test_reset_state_forces_re_emit(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_reset_state_forces_re_emit(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event = _make_event("job-r", ["in"], ["out"])
     emitter.emit(event, force=True)
     emitter.reset_state()
     assert emitter.emit(event) is True
 
 
-def test_reset_state_clears_known_jobs(ol_cfg, state_file) -> None:
-    """After reset, previously seen jobs are forgotten — no spurious removals."""
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_reset_state_clears_known_jobs(ol_cfg, tmp_path) -> None:
+    emitter = _make_emitter(ol_cfg, tmp_path)
     event_a = _make_event("job-a", ["in"], ["out"])
     event_b = _make_event("job-b", ["in"], ["out"])
 
@@ -229,10 +254,13 @@ def test_reset_state_clears_known_jobs(ol_cfg, state_file) -> None:
     assert removed == 0
 
 
-def test_reset_state_deletes_state_file(ol_cfg, state_file) -> None:
-    emitter = _make_emitter(ol_cfg, state_file)
+def test_reset_state_persisted_to_db(ol_cfg, tmp_path) -> None:
+    """After reset, a new emitter from the same store has no known jobs."""
+    emitter = _make_emitter(ol_cfg, tmp_path)
     emitter.emit_batch([_make_event("job-a", ["in"], ["out"])], force=True)
-    assert state_file.exists()
-
     emitter.reset_state()
-    assert not state_file.exists()
+
+    emitter2 = _make_emitter(ol_cfg, tmp_path)
+    _, _, removed = emitter2.emit_batch([])
+    assert removed == 0
+    assert emitter2._known_jobs == {}

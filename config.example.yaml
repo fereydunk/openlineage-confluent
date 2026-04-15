@@ -44,3 +44,11 @@ pipeline:
   # If true, re-emit all events every cycle even if lineage hasn't changed.
   # Useful after a backend restart. Default: false (diff-only).
   PIPELINE_FULL_REFRESH: false
+
+  # Parallel threads for event emission. Each thread holds one HTTP connection
+  # to the OpenLineage backend. Raise for DataHub; 8 is safe for Marquez.
+  PIPELINE_MAX_WORKERS: 8
+
+  # SQLite database path for persisting known jobs across restarts.
+  # This enables removal detection in run-once mode.
+  # PIPELINE_STATE_DB: "~/.openlineage-confluent/state.db"

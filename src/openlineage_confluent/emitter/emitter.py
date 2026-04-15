@@ -1,11 +1,11 @@
 """OpenLineage event emitter.
 
 Wraps openlineage-python's transport layer and adds:
-  - console transport for local debugging
-  - diff tracking (only emit changed job lineages)
-  - removal detection (ABORT event when a job disappears from the graph)
-  - state persistence across runs (so run-once can detect removals)
-  - structured logging
+  - Parallel emission via ThreadPoolExecutor
+  - Diff tracking (only emit changed job lineages)
+  - Removal detection (ABORT event when a job disappears from the graph)
+  - SQLite-backed state persistence (via StateStore)
+  - Structured logging
 """
 
 from __future__ import annotations
@@ -13,9 +13,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
+from functools import partial
 
 from openlineage.client import OpenLineageClient
 from openlineage.client.event_v2 import Job, Run, RunEvent, RunState
@@ -23,11 +25,9 @@ from openlineage.client.transport.http import ApiKeyTokenProvider, HttpConfig, H
 from openlineage.client.transport.console import ConsoleConfig, ConsoleTransport
 
 from openlineage_confluent.config import OpenLineageConfig
+from openlineage_confluent.emitter.state_store import StateStore
 
 log = logging.getLogger(__name__)
-
-# Default state file location — persists known-jobs across process restarts.
-DEFAULT_STATE_FILE = Path.home() / ".openlineage-confluent" / "state.json"
 
 
 def _event_fingerprint(event: RunEvent) -> str:
@@ -44,58 +44,30 @@ def _event_fingerprint(event: RunEvent) -> str:
 
 
 class LineageEmitter:
-    """Thin wrapper around OpenLineageClient with diff-tracking and removal detection.
+    """Parallel OpenLineageClient wrapper with diff-tracking and removal detection.
 
-    State (known jobs + fingerprints) is persisted to *state_file* after every
-    emit_batch() call, so that run-once invocations across restarts can still
-    detect when a job has been removed from Confluent Cloud.
+    Events are emitted concurrently via a ThreadPoolExecutor. The HTTP call is
+    always made outside any lock; only the in-memory dict reads/writes are
+    guarded. State is persisted to SQLite via the injected StateStore after
+    each emit_batch() call.
     """
 
     def __init__(
         self,
         cfg: OpenLineageConfig,
         *,
-        state_file: Path = DEFAULT_STATE_FILE,
+        state_store: StateStore,
+        max_workers: int = 8,
     ) -> None:
         self._cfg = cfg
         self._client = self._build_client(cfg)
-        self._state_file = state_file
+        self._store = state_store
+        self._max_workers = max_workers
+        self._lock = threading.Lock()
 
-        # Persisted across runs: job_key → (namespace, name)
-        self._known_jobs: dict[str, tuple[str, str]] = {}
-        # Persisted across runs: job_key → last-emitted fingerprint
-        self._last_fingerprints: dict[str, str] = {}
-
-        self._load_state()
-
-    # ------------------------------------------------------------------
-    # State persistence
-    # ------------------------------------------------------------------
-
-    def _load_state(self) -> None:
-        """Restore known-jobs and fingerprints from the state file if it exists."""
-        if not self._state_file.exists():
-            return
-        try:
-            raw = json.loads(self._state_file.read_text())
-            self._known_jobs = {k: tuple(v) for k, v in raw.get("known_jobs", {}).items()}  # type: ignore[misc]
-            self._last_fingerprints = raw.get("fingerprints", {})
-            log.debug("Loaded state: %d known jobs from %s",
-                      len(self._known_jobs), self._state_file)
-        except Exception:
-            log.warning("Could not load state file %s — starting fresh", self._state_file)
-
-    def _save_state(self) -> None:
-        """Persist current known-jobs and fingerprints to the state file."""
-        try:
-            self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "known_jobs": {k: list(v) for k, v in self._known_jobs.items()},
-                "fingerprints": self._last_fingerprints,
-            }
-            self._state_file.write_text(json.dumps(payload, indent=2))
-        except Exception:
-            log.warning("Could not save state file %s", self._state_file)
+        # Initialise in-memory state from the persisted store.
+        self._known_jobs: dict[str, tuple[str, str]] = state_store.get_known_jobs()
+        self._last_fingerprints: dict[str, str] = state_store.get_fingerprints()
 
     # ------------------------------------------------------------------
     # Client factory
@@ -114,63 +86,81 @@ class LineageEmitter:
         return OpenLineageClient(transport=HttpTransport(http_cfg))
 
     # ------------------------------------------------------------------
-    # Emit
+    # Emit (thread-safe — called concurrently from emit_batch)
     # ------------------------------------------------------------------
 
     def emit(self, event: RunEvent, *, force: bool = False) -> bool:
         """Emit a single RunEvent.
 
-        If *force* is False, skip events whose lineage fingerprint matches
-        the last emission (no-op when nothing changed).
+        Thread-safe: the lock is held only around dict reads/writes, not
+        around the HTTP call. This allows the ThreadPoolExecutor in
+        emit_batch() to send events concurrently.
 
         Returns True if the event was emitted, False if skipped.
         """
         job_key = f"{event.job.namespace}/{event.job.name}"
         fingerprint = _event_fingerprint(event)
 
-        # Register so removal can be detected in a future cycle.
-        self._known_jobs[job_key] = (event.job.namespace, event.job.name)
+        # — guard dict reads and the skip check —
+        with self._lock:
+            self._known_jobs[job_key] = (event.job.namespace, event.job.name)
+            if not force and self._last_fingerprints.get(job_key) == fingerprint:
+                log.debug("Skipping unchanged lineage for %s", job_key)
+                return False
 
-        if not force and self._last_fingerprints.get(job_key) == fingerprint:
-            log.debug("Skipping unchanged lineage for %s", job_key)
-            return False
-
+        # — HTTP call outside the lock —
         try:
             self._client.emit(event)
-            self._last_fingerprints[job_key] = fingerprint
-            log.info("Emitted lineage for %s (in=%d, out=%d)",
-                     job_key,
-                     len(event.inputs or []),
-                     len(event.outputs or []))
-            return True
         except Exception:
             log.exception("Failed to emit event for %s", job_key)
             return False
 
+        # — guard fingerprint write —
+        with self._lock:
+            self._last_fingerprints[job_key] = fingerprint
+
+        log.info("Emitted lineage for %s (in=%d, out=%d)",
+                 job_key,
+                 len(event.inputs or []),
+                 len(event.outputs or []))
+        return True
+
     def emit_batch(self, events: list[RunEvent], *, force: bool = False) -> tuple[int, int, int]:
-        """Emit a list of events. Returns (emitted, skipped, removed).
+        """Emit a list of events concurrently. Returns (emitted, skipped, removed).
 
         Removal detection: any job previously seen that is absent from *events*
-        receives an ABORT RunEvent so the backend can mark it as gone.
-        State is persisted to disk after every call.
+        receives a serial ABORT RunEvent before the parallel emission begins.
+        State is flushed to SQLite after all events are processed.
         """
         current_keys = {f"{e.job.namespace}/{e.job.name}" for e in events}
 
-        # Jobs seen before but absent this cycle → they have been removed.
-        removed_keys = [k for k in self._known_jobs if k not in current_keys]
+        # — detect removals under lock (needs full dict scan) —
+        with self._lock:
+            removed_keys = [k for k in self._known_jobs if k not in current_keys]
+
+        # — emit ABORT for each removed job (serial — typically a small set) —
         for job_key in removed_keys:
-            namespace, name = self._known_jobs.pop(job_key)
-            self._last_fingerprints.pop(job_key, None)
+            with self._lock:
+                namespace, name = self._known_jobs.pop(job_key)
+                self._last_fingerprints.pop(job_key, None)
             self._emit_removal(namespace, name)
 
+        # — emit current events in parallel —
         emitted = skipped = 0
-        for event in events:
-            if self.emit(event, force=force):
-                emitted += 1
-            else:
-                skipped += 1
+        _emit = partial(self.emit, force=force)
+        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            futures = {pool.submit(_emit, event): event for event in events}
+            for future in as_completed(futures):
+                if future.result():
+                    emitted += 1
+                else:
+                    skipped += 1
 
-        self._save_state()
+        # — persist state to SQLite —
+        with self._lock:
+            jobs_snapshot = dict(self._known_jobs)
+            fp_snapshot   = dict(self._last_fingerprints)
+        self._store.flush(jobs_snapshot, fp_snapshot)
 
         log.info("Batch complete — emitted=%d skipped=%d removed=%d",
                  emitted, skipped, len(removed_keys))
@@ -192,8 +182,8 @@ class LineageEmitter:
             log.exception("Failed to emit removal event for %s/%s", namespace, name)
 
     def reset_state(self) -> None:
-        """Clear all diff state and delete the state file."""
-        self._last_fingerprints.clear()
-        self._known_jobs.clear()
-        if self._state_file.exists():
-            self._state_file.unlink()
+        """Clear all diff state and wipe the persistent store."""
+        with self._lock:
+            self._last_fingerprints.clear()
+            self._known_jobs.clear()
+        self._store.flush({}, {})

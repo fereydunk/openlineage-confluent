@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -143,11 +144,16 @@ class ConfluentLineageClient:
         env = self._cfg.environment_id
         cluster = self._cfg.cluster_id
 
-        connectors = self.list_connectors()
-        log.info("Found %d connectors", len(connectors))
+        # Fetch connectors and Flink statements concurrently — they hit
+        # independent APIs (Connect REST vs Confluent CLI) with no shared state.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_conn = pool.submit(self.list_connectors)
+            f_stmt = pool.submit(self.list_flink_statements)
+        connectors = f_conn.result()
+        statements  = f_stmt.result()
 
-        statements = self.list_flink_statements()
-        log.info("Found %d Flink statements", len(statements))
+        log.info("Found %d connectors, %d Flink statements",
+                 len(connectors), len(statements))
 
         edges: list[LineageEdge] = []
 

@@ -9,6 +9,8 @@ import yaml
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_DEFAULT_STATE_DB = Path.home() / ".openlineage-confluent" / "state.db"
+
 
 class ConfluentConfig(BaseSettings):
     """Confluent Cloud credentials and target identifiers."""
@@ -59,6 +61,14 @@ class PipelineConfig(BaseSettings):
 
     poll_interval_seconds: int = Field(default=60, alias="PIPELINE_POLL_INTERVAL")
     emit_full_refresh: bool = Field(default=False, alias="PIPELINE_FULL_REFRESH")
+
+    # Number of parallel threads for event emission.
+    # Rule of thumb: 2× the number of CPU cores, capped at the rate limit of
+    # the OpenLineage backend. 8 is safe for Marquez; raise for DataHub.
+    max_workers: int = Field(default=8, alias="PIPELINE_MAX_WORKERS")
+
+    # Path to the SQLite state database that persists known jobs across runs.
+    state_db: Path = Field(default=_DEFAULT_STATE_DB, alias="PIPELINE_STATE_DB")
 
 
 class AppConfig:

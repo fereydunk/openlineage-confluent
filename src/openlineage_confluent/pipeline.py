@@ -13,6 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from openlineage_confluent.config import AppConfig
 from openlineage_confluent.confluent.client import ConfluentLineageClient
 from openlineage_confluent.emitter.emitter import LineageEmitter
+from openlineage_confluent.emitter.state_store import StateStore
 from openlineage_confluent.mapping.mapper import ConfluentOpenLineageMapper
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,12 @@ class LineagePipeline:
         self._cfg = cfg
         self._client = ConfluentLineageClient(cfg.confluent)
         self._mapper = ConfluentOpenLineageMapper(cfg.confluent, cfg.openlineage)
-        self._emitter = LineageEmitter(cfg.openlineage)
+        self._store  = StateStore(cfg.pipeline.state_db)
+        self._emitter = LineageEmitter(
+            cfg.openlineage,
+            state_store=self._store,
+            max_workers=cfg.pipeline.max_workers,
+        )
         self._cycle = 0
 
     # ------------------------------------------------------------------
@@ -92,6 +98,7 @@ class LineagePipeline:
 
     def close(self) -> None:
         self._client.close()
+        self._store.close()
 
     def __enter__(self) -> "LineagePipeline":
         return self
