@@ -3,6 +3,7 @@
 Wraps openlineage-python's transport layer and adds:
   - console transport for local debugging
   - diff tracking (only emit changed job lineages)
+  - removal detection (ABORT event when a job disappears from the graph)
   - structured logging
 """
 
@@ -11,10 +12,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any
+import uuid
+from datetime import datetime, timezone
 
 from openlineage.client import OpenLineageClient
-from openlineage.client.event_v2 import RunEvent
+from openlineage.client.event_v2 import Job, Run, RunEvent, RunState
 from openlineage.client.transport.http import ApiKeyTokenProvider, HttpConfig, HttpTransport
 from openlineage.client.transport.console import ConsoleConfig, ConsoleTransport
 
@@ -37,13 +39,15 @@ def _event_fingerprint(event: RunEvent) -> str:
 
 
 class LineageEmitter:
-    """Thin wrapper around OpenLineageClient with diff-tracking."""
+    """Thin wrapper around OpenLineageClient with diff-tracking and removal detection."""
 
     def __init__(self, cfg: OpenLineageConfig) -> None:
         self._cfg = cfg
         self._client = self._build_client(cfg)
-        # fingerprint → last emitted fingerprint
         self._last_fingerprints: dict[str, str] = {}
+        # Tracks every job seen so far: job_key → (namespace, name)
+        # Used to detect jobs that have disappeared from the lineage graph.
+        self._known_jobs: dict[str, tuple[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Client factory
@@ -76,6 +80,9 @@ class LineageEmitter:
         job_key = f"{event.job.namespace}/{event.job.name}"
         fingerprint = _event_fingerprint(event)
 
+        # Register so removal can be detected in a future cycle.
+        self._known_jobs[job_key] = (event.job.namespace, event.job.name)
+
         if not force and self._last_fingerprints.get(job_key) == fingerprint:
             log.debug("Skipping unchanged lineage for %s", job_key)
             return False
@@ -92,17 +99,48 @@ class LineageEmitter:
             log.exception("Failed to emit event for %s", job_key)
             return False
 
-    def emit_batch(self, events: list[RunEvent], *, force: bool = False) -> tuple[int, int]:
-        """Emit a list of events. Returns (emitted_count, skipped_count)."""
+    def emit_batch(self, events: list[RunEvent], *, force: bool = False) -> tuple[int, int, int]:
+        """Emit a list of events. Returns (emitted, skipped, removed).
+
+        Removal detection: any job previously seen that is absent from *events*
+        receives an ABORT RunEvent so the backend can mark it as gone.
+        """
+        current_keys = {f"{e.job.namespace}/{e.job.name}" for e in events}
+
+        # Jobs seen before but absent this cycle → they have been removed.
+        removed_keys = [k for k in self._known_jobs if k not in current_keys]
+        for job_key in removed_keys:
+            namespace, name = self._known_jobs.pop(job_key)
+            self._last_fingerprints.pop(job_key, None)
+            self._emit_removal(namespace, name)
+
         emitted = skipped = 0
         for event in events:
             if self.emit(event, force=force):
                 emitted += 1
             else:
                 skipped += 1
-        log.info("Batch complete — emitted=%d skipped=%d", emitted, skipped)
-        return emitted, skipped
+
+        log.info("Batch complete — emitted=%d skipped=%d removed=%d",
+                 emitted, skipped, len(removed_keys))
+        return emitted, skipped, len(removed_keys)
+
+    def _emit_removal(self, namespace: str, name: str) -> None:
+        """Emit an ABORT event for a job that has disappeared from the lineage graph."""
+        event = RunEvent(
+            eventType=RunState.ABORT,
+            eventTime=datetime.now(timezone.utc).isoformat(),
+            job=Job(namespace=namespace, name=name),
+            run=Run(runId=str(uuid.uuid4())),
+            producer=self._cfg.producer,
+        )
+        try:
+            self._client.emit(event)
+            log.info("Emitted removal (ABORT) for %s/%s", namespace, name)
+        except Exception:
+            log.exception("Failed to emit removal event for %s/%s", namespace, name)
 
     def reset_state(self) -> None:
-        """Clear diff state — next emit_batch will send everything."""
+        """Clear all diff state — next emit_batch will send everything fresh."""
         self._last_fingerprints.clear()
+        self._known_jobs.clear()

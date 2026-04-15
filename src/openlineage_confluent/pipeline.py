@@ -47,7 +47,7 @@ class LineagePipeline:
 
         events = self._mapper.map_all(graph, cycle_key=cycle_key)
         force = self._cfg.pipeline.emit_full_refresh or self._cycle == 1
-        emitted, skipped = self._emitter.emit_batch(events, force=force)
+        emitted, skipped, removed = self._emitter.emit_batch(events, force=force)
 
         stats = {
             "cycle": self._cycle,
@@ -57,6 +57,7 @@ class LineagePipeline:
             "events_mapped": len(events),
             "events_emitted": emitted,
             "events_skipped": skipped,
+            "events_removed": removed,
             "fetch_ms": fetch_ms,
         }
         log.info("Cycle #%d stats: %s", self._cycle, stats)
