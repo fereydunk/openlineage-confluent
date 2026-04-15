@@ -1,9 +1,11 @@
-"""Data models for Confluent Cloud REST API responses.
+"""Data models for all Confluent lineage sources.
 
-Confluent lineage is NOT in the Atlas catalog (/catalog/v1/lineage/).
-Instead we build it from two sources:
-  1. Connect API  — connector configs (source/sink topic mapping)
-  2. Flink SQL API — statement SQL (parsed for input/output tables)
+Lineage is assembled from five sources:
+  1. Connect API (managed)       — connector configs, topic mappings
+  2. Flink SQL (CLI)             — statement SQL, parsed for tables
+  3. Confluent Metrics API       — consumer_lag_offsets → consumer group → topic
+  4. ksqlDB REST API             — persistent queries, stream/table → topic map
+  5. Self-managed Connect REST   — connector configs from customer-hosted clusters
 """
 
 from __future__ import annotations
@@ -14,43 +16,41 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
-# ---------------------------------------------------------------------------
-# Connector models  (api.confluent.cloud/connect/v1/...)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Connector models  (managed + self-managed Connect)
+# ──────────────────────────────────────────────────────────────────────────────
 
 class ConnectorType(StrEnum):
     SOURCE = "source"
     SINK   = "sink"
 
 
-class ConnectorStatus(StrEnum):
-    RUNNING  = "RUNNING"
-    PAUSED   = "PAUSED"
-    FAILED   = "FAILED"
-    DEGRADED = "DEGRADED"
-
-
 class ConnectorInfo(BaseModel):
-    """Metadata about a single Confluent Cloud Managed Connector."""
+    """Metadata for a managed or self-managed Kafka Connect connector."""
+
     id: str
     name: str
-    status: ConnectorStatus
+    # str, not a StrEnum — self-managed clusters can return non-standard states
+    # (e.g. "UNASSIGNED", "RESTARTING") that aren't in the Confluent managed set.
+    status: str
     connector_type: ConnectorType = Field(alias="type")
     config: dict[str, Any] = Field(default_factory=dict)
 
+    # None  → Confluent Cloud managed connector (namespace keyed on env_id)
+    # "str" → self-managed cluster label (namespace keyed on this value)
+    connect_cluster: str | None = None
+
     model_config = {"populate_by_name": True}
 
-    # ---- convenience -------------------------------------------------------
-
     def topics_produced(self) -> list[str]:
-        """Topics this connector writes to (source connectors)."""
+        """Topics this source connector writes to."""
         if self.connector_type != ConnectorType.SOURCE:
             return []
         raw = self.config.get("kafka.topic") or self.config.get("topic") or ""
         return [t.strip() for t in raw.split(",") if t.strip()]
 
     def topics_consumed(self) -> list[str]:
-        """Topics this connector reads from (sink connectors)."""
+        """Topics this sink connector reads from."""
         if self.connector_type != ConnectorType.SINK:
             return []
         raw = (
@@ -62,21 +62,13 @@ class ConnectorInfo(BaseModel):
         return [t.strip() for t in raw.split(",") if t.strip()]
 
 
-# ---------------------------------------------------------------------------
-# Flink Statement models  (api.confluent.cloud/sql/v1/...)
-# ---------------------------------------------------------------------------
-
-class FlinkStatementStatus(StrEnum):
-    RUNNING   = "RUNNING"
-    COMPLETED = "COMPLETED"
-    FAILED    = "FAILED"
-    STOPPED   = "STOPPED"
-    PENDING   = "PENDING"
-    DELETING  = "DELETING"
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Flink Statement models  (confluent flink statement list -o json)
+# ──────────────────────────────────────────────────────────────────────────────
 
 class FlinkStatement(BaseModel):
     """A Confluent Cloud Flink SQL statement."""
+
     name: str
     sql: str = Field(alias="statement")
     status: str = "UNKNOWN"
@@ -88,31 +80,92 @@ class FlinkStatement(BaseModel):
         return self.status.upper() == "RUNNING"
 
 
-# ---------------------------------------------------------------------------
-# Internal lineage graph edge (derived, not from API)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Consumer Group models  (Confluent Metrics API — consumer_lag_offsets)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ConsumerGroupInfo(BaseModel):
+    """A Kafka consumer group and the topics it actively reads.
+
+    Sourced from the Confluent Metrics API consumer_lag_offsets metric,
+    grouped by consumer_group_id + topic. Covers application consumers,
+    Kafka Streams apps, and self-managed Connect workers.
+    """
+
+    group_id: str
+    topics: list[str] = Field(default_factory=list)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ksqlDB models  (ksqlDB REST API — SHOW QUERIES EXTENDED)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class KsqlQuery(BaseModel):
+    """A ksqlDB persistent query with resolved Kafka topic bindings.
+
+    Source streams/tables are resolved to their underlying Kafka topics
+    via SHOW STREAMS/TABLES EXTENDED before storing in source_topics.
+    """
+
+    query_id: str
+    sql: str
+    state: str = "UNKNOWN"
+    sink_topics: list[str] = Field(default_factory=list)    # actual Kafka topics written
+    source_topics: list[str] = Field(default_factory=list)  # resolved Kafka topic names
+    ksql_cluster_id: str
+
+    def is_running(self) -> bool:
+        return self.state.upper() == "RUNNING"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Internal lineage graph edge (derived, not from any single API)
+# ──────────────────────────────────────────────────────────────────────────────
 
 class LineageEdge(BaseModel):
-    """One data-flow edge in our constructed lineage graph."""
+    """One directed data-flow edge in the lineage graph.
 
-    source_name: str          # topic / external system name
+    Edge semantics by job_type:
+      kafka_connect_source      — external → kafka_topic
+      kafka_connect_sink        — kafka_topic → external
+      flink_statement           — kafka_topic → kafka_topic
+      kafka_consumer_group      — kafka_topic → consumer_group
+      ksqldb_query              — kafka_topic → kafka_topic
+
+    The mapper converts edges to RunEvents. Only kafka_topic typed endpoints
+    become OpenLineage Dataset nodes; external and consumer_group endpoints
+    are silently dropped on the OL side (resulting in inputs-only or
+    outputs-only events, which is correct and intentional).
+    """
+
+    source_name: str          # topic, external system, or consumer group name
     source_type: str          # "kafka_topic" | "external"
     target_name: str
-    target_type: str          # "kafka_topic" | "external"
-    job_name: str             # connector or Flink statement name
-    job_type: str             # "kafka_connect_source" | "kafka_connect_sink" | "flink_statement"
-    job_namespace_hint: str   # for building OL namespace
+    target_type: str          # "kafka_topic" | "external" | "consumer_group"
+    job_name: str             # connector name, statement name, group ID, query ID
+    job_type: str             # see docstring above
+    job_namespace_hint: str   # used directly as the OL Job namespace
 
 
 class LineageGraph(BaseModel):
-    """Derived lineage graph for one cluster poll cycle."""
+    """Complete lineage graph built from all sources in one poll cycle."""
+
     edges: list[LineageEdge] = Field(default_factory=list)
-    connectors: list[ConnectorInfo] = Field(default_factory=list)
+
+    # Constituent source objects (kept for summary and debugging)
+    connectors: list[ConnectorInfo] = Field(default_factory=list)      # managed + self-managed
     statements: list[FlinkStatement] = Field(default_factory=list)
+    consumer_groups: list[ConsumerGroupInfo] = Field(default_factory=list)
+    ksql_queries: list[KsqlQuery] = Field(default_factory=list)
 
     def summary(self) -> dict[str, int]:
+        managed  = sum(1 for c in self.connectors if c.connect_cluster is None)
+        self_mgd = sum(1 for c in self.connectors if c.connect_cluster is not None)
         return {
-            "connectors": len(self.connectors),
-            "flink_statements": len(self.statements),
-            "edges": len(self.edges),
+            "managed_connectors":      managed,
+            "self_managed_connectors": self_mgd,
+            "flink_statements":        len(self.statements),
+            "consumer_groups":         len(self.consumer_groups),
+            "ksql_queries":            len(self.ksql_queries),
+            "edges":                   len(self.edges),
         }

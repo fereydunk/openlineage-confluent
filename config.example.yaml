@@ -1,23 +1,67 @@
 # openlineage-confluent — example configuration
 # Copy to config.yaml and fill in your values.
-# All keys can also be set as environment variables (see names below).
+# All scalar keys can also be set as environment variables (see names below).
+# List keys (ksql_clusters, self_managed_connect_clusters) are YAML-only.
 
 confluent:
+  # ── Required ──────────────────────────────────────────────────────────────────
   # Cloud-level API key (api.confluent.cloud — NOT Schema Registry or Kafka scoped)
   # Create under: Confluent Cloud → API Keys → Add key → Cloud resource management
   CONFLUENT_CLOUD_API_KEY:    "XXXXXXXXXXXXXXXX"
   CONFLUENT_CLOUD_API_SECRET: "your-cloud-api-secret-here"
 
   # Confluent Cloud environment and Kafka cluster IDs
-  # Found under: Confluent Cloud → Environments → <your-env> → Cluster settings
+  # Found under: Confluent Cloud → Environments → <env> → Cluster settings
   CONFLUENT_ENV_ID:     "env-xxxxxx"
   CONFLUENT_CLUSTER_ID: "lkc-xxxxxx"
 
-  # Regional Flink REST endpoint
+  # Regional Flink REST endpoint (stored for future use; CLI is used today)
   # Found under: Confluent Cloud → Flink → Compute pools → REST endpoint
-  # The bridge uses the Confluent CLI (not this URL directly) for Flink statement listing,
-  # but the URL is stored for future direct REST access.
   CONFLUENT_FLINK_REST_URL: "https://flink.<region>.aws.confluent.cloud"
+
+  # ── Metrics API (consumer group lineage) ──────────────────────────────────────
+  # Uses consumer_lag_offsets to discover which consumer groups read which topics.
+  # Covers: application consumers, Kafka Streams, self-managed Connect workers.
+  #
+  # Optional: if omitted, falls back to CONFLUENT_CLOUD_API_KEY.
+  # The key must have the MetricsViewer role (Environment or Org level).
+  # Grant under: Confluent Cloud → Access Control → Service Accounts → Roles.
+  #
+  # CONFLUENT_METRICS_API_KEY:    "YYYYYYYYYYYYYYYY"
+  # CONFLUENT_METRICS_API_SECRET: "your-metrics-api-secret"
+  #
+  # How far back to look (minutes). Default 10 covers one poll cycle + Metrics
+  # API ingestion lag (~2-3 min). Increase if poll_interval is longer than 10 min.
+  # CONFLUENT_METRICS_LOOKBACK_MINUTES: 10
+  #
+  # Extra consumer group prefixes to exclude beyond the built-in filters
+  # (built-in: "_" and "confluent_cli_consumer_"):
+  # consumer_group_exclude_prefixes:
+  #   - "legacy-internal-"
+  #   - "test-"
+
+  # ── ksqlDB clusters (list, YAML-only) ─────────────────────────────────────────
+  # One entry per ksqlDB cluster to scan for persistent query lineage.
+  # Create a ksqlDB-scoped API key under: Confluent Cloud → ksqlDB → API Keys.
+  #
+  # ksql_clusters:
+  #   - cluster_id:    "lksqlc-xxxxxx"
+  #     rest_endpoint: "https://pksqlc-xxxxxx.<region>.aws.confluent.cloud"
+  #     api_key:       "KSQLAPIKEY"
+  #     api_secret:    "ksql-api-secret"
+
+  # ── Self-managed Connect clusters (list, YAML-only) ───────────────────────────
+  # One entry per self-managed Kafka Connect cluster to scrape.
+  # The "name" field is used as the namespace label: kafka-connect://<name>.
+  # Leave username/password out for unauthenticated clusters.
+  #
+  # self_managed_connect_clusters:
+  #   - name:          "on-prem-etl"
+  #     rest_endpoint: "http://connect-host-1:8083"
+  #   - name:          "aws-connect"
+  #     rest_endpoint: "https://connect-host-2.example.com:8083"
+  #     username:      "admin"
+  #     password:      "secret"
 
 openlineage:
   # Transport: "http" → POST to backend | "console" → print to stdout (debug)
@@ -25,7 +69,7 @@ openlineage:
 
   # OpenLineage backend URL
   # Marquez default: http://localhost:5000
-  # DataHub:         http://localhost:8080
+  # DataHub:         http://localhost:8080/openlineage
   OPENLINEAGE_URL: "http://localhost:5000"
 
   # Optional: API key if your backend requires auth
@@ -45,10 +89,8 @@ pipeline:
   # Useful after a backend restart. Default: false (diff-only).
   PIPELINE_FULL_REFRESH: false
 
-  # Parallel threads for event emission. Each thread holds one HTTP connection
-  # to the OpenLineage backend. Raise for DataHub; 8 is safe for Marquez.
+  # Parallel threads for event emission. Raise for DataHub; 8 is safe for Marquez.
   PIPELINE_MAX_WORKERS: 8
 
   # SQLite database path for persisting known jobs across restarts.
-  # This enables removal detection in run-once mode.
   # PIPELINE_STATE_DB: "~/.openlineage-confluent/state.db"

@@ -2,7 +2,7 @@
 
 ## Problem
 
-Confluent Cloud builds operational lineage internally (visible in the Confluent UI under Stream Lineage), but does not expose it through any standard API. The **OpenLineage spec** is the de-facto standard for lineage interchange — understood by Marquez, DataHub, OpenMetadata, and others. This bridge translates between the two.
+Confluent Cloud builds operational lineage internally (visible in the Confluent UI under Stream Lineage), but does not expose it through any standard API. The **OpenLineage spec** is the de-facto standard for lineage interchange — understood by Marquez, DataHub, OpenMetadata, and others. This bridge reconstructs that lineage from first principles and emits it in the OpenLineage format.
 
 ## What we tried first: Stream Catalog API
 
@@ -13,93 +13,170 @@ Confluent exposes an Atlas-compatible catalog at `api.confluent.cloud/catalog/v1
 - Entity GUIDs are non-stable (they change between API calls)
 - The catalog is designed for schema metadata (Avro/Protobuf), not operational lineage
 
-**Conclusion:** The Stream Catalog API does not expose the graph that drives the Confluent Stream Lineage UI.
+**Conclusion:** The Stream Catalog API does not expose the graph that drives the Confluent Stream Lineage UI. Investigation scripts are preserved in `scripts/diagnose_*.py`.
 
-## Actual approach: build lineage from first principles
+---
 
-Lineage is reconstructed from two authoritative sources that **do** expose it:
+## Actual approach: five lineage sources
 
-### 1. Connect REST API
+Lineage is reconstructed from five authoritative sources, all fetched concurrently:
+
+### 1. Managed Connect REST API
 
 ```
 GET api.confluent.cloud/connect/v1/environments/{env}/clusters/{cluster}/connectors
     ?expand=info,status
 ```
 
-Auth: Cloud-level API key (HTTP Basic).
+Auth: Cloud-level API key (HTTP Basic). Returns all managed connectors with their configs. Connector configs contain topic bindings:
 
-Returns all managed connectors with their configs. Connector configs contain topic bindings:
 - Source connectors: `kafka.topic` or `topic` → produces to
 - Sink connectors: `topics` or `kafka.topics` → consumes from
 
-This gives us `(connector_name → topic)` edges with no parsing required.
-
 ### 2. Flink SQL via CLI
 
-The Flink REST API (`flink.<region>.aws.confluent.cloud/sql/v1/…`) requires user-level OAuth tokens. Cloud API keys get 401. Rather than requiring users to obtain OAuth tokens, the bridge shells out to:
+The Flink REST API (`flink.<region>.aws.confluent.cloud/sql/v1/…`) requires user-level OAuth tokens. Cloud API keys get 401. The bridge shells out to:
 
 ```bash
 confluent flink statement list --environment {env} -o json
 ```
 
-The Confluent CLI already holds valid user credentials and emits clean JSON with `name`, `statement`, `status`, and `compute_pool` fields.
+The CLI holds valid user credentials and emits clean JSON with `name`, `statement`, `status`, and `compute_pool` fields. Only RUNNING statements are processed. SQL is parsed to extract input/output table names.
 
-Only RUNNING statements are processed. The SQL is parsed to extract input and output table names.
+### 3. Confluent Metrics API — consumer group lineage
 
-### 3. SQL parser
+```
+POST https://api.telemetry.confluent.cloud/v2/metrics/cloud/query
+{
+  "aggregations": [{"metric": "io.confluent.kafka.server/consumer_lag_offsets", "agg": "SUM"}],
+  "filter": {"field": "resource.kafka.id", "op": "EQ", "value": "<cluster_id>"},
+  "granularity": "PT1M",
+  "intervals": ["<last-N-minutes>"],
+  "group_by": ["metric.consumer_group_id", "metric.topic"]
+}
+```
 
-`sql_parser.py` uses regex to extract table references:
+Auth: Cloud-level API key with the **MetricsViewer** role (grant at Environment or Org level). A dedicated metrics key can be configured; if omitted, the cloud API key is used.
+
+The `consumer_lag_offsets` metric is the only cloud-plane signal that exposes `consumer_group_id` alongside `topic`. This covers every component that commits Kafka consumer group offsets:
+
+- Application consumers (Java, Python, Go, etc.)
+- Kafka Streams applications
+- Self-managed Connect workers (`connect-<name>` groups)
+- Any other component using the Kafka consumer group protocol
+
+**Important limitation:** There is no `client_id` dimension on any broker-side metric. Producer identity cannot be inferred from the Metrics API alone — the broker aggregates by topic/partition/group, not by producer client ID.
+
+**Internal group filtering:** Groups with the `_` prefix (`_confluent-*`, `_ksql-*`, `_schemas`) and `confluent_cli_consumer_*` prefix are excluded. These are internal Confluent infrastructure groups already represented by their dedicated lineage sources.
+
+**Pagination:** The Metrics API returns up to 1,000 rows per request. The bridge follows `meta.pagination.page_token` until exhausted.
+
+### 4. ksqlDB REST API
+
+Three statements are executed against each configured ksqlDB cluster:
+
+```
+POST {rest_endpoint}/ksql  {"ksql": "SHOW STREAMS EXTENDED;"}
+POST {rest_endpoint}/ksql  {"ksql": "SHOW TABLES EXTENDED;"}
+POST {rest_endpoint}/ksql  {"ksql": "SHOW QUERIES EXTENDED;"}
+```
+
+Auth: ksqlDB-scoped API key (create under Confluent Cloud → ksqlDB cluster → API Keys). Content-Type must be `application/vnd.ksql.v1+json`.
+
+The `SHOW QUERIES EXTENDED` response includes `sinkKafkaTopics` (actual Kafka topic names) and `sources` (ksqlDB stream/table names). Stream names are resolved to their underlying Kafka topics via the map built from the first two statements. Self-referential entries (output topic also listed as a source) are removed.
+
+Only RUNNING persistent queries with both resolved source and sink topics are emitted.
+
+### 5. Self-managed Kafka Connect REST API
+
+```
+GET {endpoint}/connectors?expand=info,status
+```
+
+Auth: optional HTTP Basic. Available since Kafka Connect 2.3 (KIP-449). For older clusters that return 404 on `?expand`, the bridge falls back to individual `GET /connectors/{name}` and `GET /connectors/{name}/status` calls.
+
+Each configured self-managed cluster has a unique `name` label used as the namespace: `kafka-connect://<name>`.
+
+---
+
+## SQL parser
+
+`sql_parser.py` uses regex to extract table references from Flink SQL:
 
 - **Outputs**: `INSERT INTO \`table\`` and `CREATE TABLE [IF NOT EXISTS] \`table\``
 - **Inputs**: `FROM \`table\`` and `JOIN \`table\`` — filtered to exclude SQL keywords and output tables
 
-This covers the Confluent Flink SQL dialect used in practice. More complex patterns (CTEs, subqueries) are left for future work.
+---
 
 ## Component diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  openlineage-confluent                                                   │
-│                                                                          │
-│  ┌──────────────────────┐      ┌──────────────────────────────────┐      │
-│  │ ConfluentLineage      │      │ ConfluentOpenLineageMapper       │      │
-│  │ Client                │      │                                  │      │
-│  │                       │      │  LineageEdge[]                   │      │
-│  │  list_connectors()  ──┼─┐    │  → group by job                  │      │
-│  │  list_flink_stmts() ──┼─┼───▶│  → one RunEvent per job          │      │
-│  │  (parallel fetch)     │ │    │  → stable run ID (SHA-256)       │      │
-│  │  get_lineage_graph()──┼─┘    └──────────────┬───────────────────┘      │
-│  └──────────────────────┘                      │                          │
-│                                                │                          │
-│  ┌──────────────────────┐      ┌───────────────▼───────────────────┐      │
-│  │ LineagePipeline       │      │ LineageEmitter                   │      │
-│  │                       │      │                                  │      │
-│  │  run_once()          ─┼─────▶│  emit_batch()                   │      │
-│  │  run_forever()        │      │  ├─ diff tracking (SHA-256)      │      │
-│  │  APScheduler          │      │  ├─ removal detection → ABORT    │      │
-│  └──────────────────────┘      │  └─ parallel emission             │      │
-│                                │       (ThreadPoolExecutor)        │      │
-│  ┌──────────────────────┐      └──────────────┬────────┬───────────┘      │
-│  │ StateStore (SQLite)   │◀─────────flush()────┘        │                 │
-│  │                       │                              │ HTTP            │
-│  │  WAL mode             │                              ▼                 │
-│  │  atomic full-replace  │             ┌────────────────────────────┐     │
-│  │  crash-safe           │             │  OpenLineage backend       │     │
-│  └──────────────────────┘             │  (Marquez, DataHub, ...)   │     │
-│                                       │  POST /api/v1/lineage      │     │
-└───────────────────────────────────────┴────────────────────────────┘     │
-                                                                            │
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  ConfluentLineageClient.get_lineage_graph()                                  │
+│                                                                              │
+│  ┌────────────────────┐   ┌────────────────────┐   ┌────────────────────┐   │
+│  │ list_connectors()  │   │list_flink_stmts()  │   │MetricsApiClient    │   │
+│  │ (Connect REST API) │   │ (Confluent CLI)    │   │.get_consumer_groups│   │
+│  └─────────┬──────────┘   └────────┬───────────┘   └────────┬───────────┘   │
+│            │                       │  ← concurrent →        │               │
+│  ┌─────────┴──────────┐            │            ┌───────────┴───────────┐   │
+│  │KsqlDbClient        │            │            │SelfManagedConnect     │   │
+│  │.get_queries()      │            │            │Client.get_connectors()│   │
+│  │(per ksqlDB cluster)│            │            │(per sm Connect cluster)│  │
+│  └─────────┬──────────┘            │            └───────────┬───────────┘   │
+│            └───────────────────────┼────────────────────────┘               │
+│                                    ▼                                         │
+│                         list[LineageEdge]                                    │
+│                         → LineageGraph                                       │
+└──────────────────────────────┬─────────────────────────────────────────────-┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  ConfluentOpenLineageMapper.map_all(graph)                                   │
+│                                                                              │
+│  Group edges by (job_name, job_type, job_namespace_hint)                     │
+│  → one RunEvent per unique job                                               │
+│                                                                              │
+│  Edge type → OL event shape:                                                 │
+│    kafka_connect_source    → outputs only (topic Datasets)                   │
+│    kafka_connect_sink      → inputs only  (topic Datasets)                   │
+│    flink_statement         → inputs + outputs                                │
+│    kafka_consumer_group    → inputs only  (consumer_group target ignored)    │
+│    ksqldb_query            → inputs + outputs                                │
+│                                                                              │
+│  Run ID: SHA-256(namespace:name:cycle_key)[:16] → UUID4  (deterministic)    │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LineageEmitter.emit_batch(events)                                           │
+│                                                                              │
+│  ├─ Removal detection → ABORT events for disappeared jobs                    │
+│  ├─ Diff tracking (SHA-256 fingerprint per job) → skip unchanged             │
+│  ├─ Parallel HTTP emission (ThreadPoolExecutor, lock released during I/O)    │
+│  └─ Atomic SQLite flush (WAL mode, one transaction per cycle)                │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    ▼                     ▼
+             StateStore (SQLite)   OpenLineage backend
+             WAL, crash-safe       (Marquez, DataHub, …)
 ```
+
+---
 
 ## OpenLineage mapping
 
 ### Namespaces
 
-| Confluent entity | OpenLineage type | Namespace | Name |
+| Confluent entity | OL type | Namespace | Name |
 |---|---|---|---|
 | Kafka topic | `Dataset` | `kafka://<bootstrap>` | `<topic-name>` |
-| Source/sink connector | `Job` | `kafka-connect://<env-id>` | `<connector-name>` |
-| Flink statement | `Job` | `flink://<env-id>` | `<statement-name>` |
+| Managed source/sink connector | `Job` | `kafka-connect://<env_id>` | `<connector-name>` |
+| Self-managed connector | `Job` | `kafka-connect://<cluster_label>` | `<connector-name>` |
+| Flink statement | `Job` | `flink://<env_id>` | `<statement-name>` |
+| Consumer group | `Job` | `kafka-consumer-group://<cluster_id>` | `<group_id>` |
+| ksqlDB persistent query | `Job` | `ksqldb://<ksql_cluster_id>` | `<query_id>` |
 
 ### Event structure
 
@@ -113,6 +190,20 @@ SHA256(f"{namespace}:{name}:{cycle_key}")[:16]  → UUID4
 - The same job in the same cycle always gets the same run ID (idempotent)
 - Different cycles get different run IDs (Marquez stores a run history)
 
+### Edge semantics and OL event shape
+
+The mapper filters on `source_type`/`target_type`. Only `"kafka_topic"` typed endpoints become OpenLineage Dataset nodes:
+
+| Job type | source_type | target_type | OL inputs | OL outputs |
+|---|---|---|---|---|
+| `kafka_connect_source` | `external` | `kafka_topic` | none | topic(s) |
+| `kafka_connect_sink` | `kafka_topic` | `external` | topic(s) | none |
+| `flink_statement` | `kafka_topic` | `kafka_topic` | topic(s) | topic(s) |
+| `kafka_consumer_group` | `kafka_topic` | `consumer_group` | topic(s) | none |
+| `ksqldb_query` | `kafka_topic` | `kafka_topic` | topic(s) | topic(s) |
+
+Consumer groups are represented as Jobs with inputs (the topics they subscribe to) and no outputs — exactly how Marquez visualises a pure consumer.
+
 ### Diff tracking
 
 The emitter computes a fingerprint for each job's lineage:
@@ -121,13 +212,15 @@ The emitter computes a fingerprint for each job's lineage:
 SHA256({job_key, sorted(inputs), sorted(outputs)})
 ```
 
-If the fingerprint matches the previous cycle, the event is skipped. This avoids flooding the backend with redundant events during stable periods. The first cycle always forces a full emit.
+If the fingerprint matches the previous cycle, the event is skipped. The first cycle always forces a full emit.
+
+---
 
 ## Removal detection
 
-When a connector or Flink statement is deleted or stops running, the bridge detects this by comparing the current event batch against `_known_jobs` — the set of jobs seen in the previous cycle.
+When a component disappears from the lineage graph (connector deleted, Flink statement stopped, consumer group idle beyond lookback window, ksqlDB query dropped), the bridge detects this by comparing the current event batch against `_known_jobs` — the set of jobs seen in the previous cycle.
 
-For every job in `_known_jobs` that is absent from the current batch, the bridge emits a `RunState.ABORT` event preserving the original job namespace and name. The job is then removed from `_known_jobs` and will not be reported again unless it reappears.
+For every absent job, the bridge emits a `RunState.ABORT` event preserving the original job namespace and name, then removes it from `_known_jobs`.
 
 ```python
 removed_keys = set(_known_jobs) - {event_key(e) for e in current_events}
@@ -136,33 +229,31 @@ for key in removed_keys:
     client.emit(RunEvent(eventType=RunState.ABORT, job=Job(namespace, name), ...))
 ```
 
-The removed job's namespace is preserved exactly — a `flink://env-x` job gets an ABORT with that same namespace, not `kafka-connect://`.
+Removal detection works correctly across process restarts because `_known_jobs` is loaded from the SQLite state database at startup.
 
-Removal detection works correctly across process restarts because `_known_jobs` is loaded from the SQLite state database at startup. A job seen in cycle N-1, absent in cycle N, and with a process restart in between will still trigger an ABORT in cycle N.
+---
 
 ## Production-scale design
 
-The original implementation was single-threaded and used a flat JSON state file. At 10,000+ topics these become bottlenecks:
-
 | Bottleneck | Solution |
 |---|---|
-| Sequential connector + Flink fetches | Parallel `ThreadPoolExecutor(max_workers=2)` in `get_lineage_graph()` |
+| Sequential multi-source fetches | Concurrent `ThreadPoolExecutor` in `get_lineage_graph()` — all 5 sources run in parallel |
 | Single-threaded HTTP emission | Parallel `ThreadPoolExecutor(max_workers=N)` in `emit_batch()` |
-| JSON state file — full rewrite per cycle, no concurrent reads | SQLite with WAL mode — single transaction per cycle, concurrent read-safe |
-| Lock held during HTTP calls | Double-acquire pattern: lock → read fingerprint → **release** → HTTP → lock → write fingerprint |
+| JSON state file — full rewrite per cycle | SQLite WAL mode — single atomic transaction per cycle |
+| Lock held during HTTP calls | Lock-release pattern: lock → read fingerprint → **release** → HTTP → lock → write fingerprint |
 
 ### SQLite StateStore
 
-`StateStore` (`src/openlineage_confluent/emitter/state_store.py`) persists known jobs and fingerprints:
+`StateStore` persists known jobs and fingerprints:
 
-- **Eager load**: full table is read into two in-memory dicts on startup — hot-path fingerprint checks are pure dict lookups, zero SQL per event.
+- **Eager load**: full table is read into two in-memory dicts at startup — hot-path fingerprint checks are pure dict lookups, zero SQL per event.
 - **Atomic flush**: one `DELETE + INSERT` transaction per `emit_batch()` call. No per-row upserts, no partial-write corruption.
-- **WAL mode** (`PRAGMA journal_mode=WAL`): readers never block writers; safe for future multi-process access.
+- **WAL mode** (`PRAGMA journal_mode=WAL`): readers never block writers.
 - **Corrupt DB recovery**: any `sqlite3.DatabaseError` at startup is caught and treated as an empty store — the process starts fresh rather than crashing.
 
 ### Thread-safe parallel emission
 
-The emitter uses a `threading.Lock` to guard `_known_jobs` and `_last_fingerprints`. The lock is deliberately **released before each HTTP call** to avoid blocking other workers during network I/O:
+The emitter uses a `threading.Lock` to guard `_known_jobs` and `_last_fingerprints`. The lock is **released before each HTTP call** to avoid blocking other workers during network I/O:
 
 ```python
 # 1. Acquire lock — check fingerprint, register job
@@ -179,21 +270,7 @@ with self._lock:
     self._last_fingerprints[key] = fingerprint
 ```
 
-`emit_batch()` submits all events to a `ThreadPoolExecutor`, collects results via `as_completed()`, then snapshots state under the lock and flushes to SQLite once per cycle.
-
-### Parallel graph fetch
-
-`ConfluentLineageClient.get_lineage_graph()` fetches connectors (HTTP) and Flink statements (CLI subprocess) concurrently:
-
-```python
-with ThreadPoolExecutor(max_workers=2) as pool:
-    f_conn = pool.submit(self.list_connectors)
-    f_stmt = pool.submit(self.list_flink_statements)
-connectors = f_conn.result()
-statements  = f_stmt.result()
-```
-
-These two calls hit completely independent APIs with no shared state, so the fetch time is `max(connect_latency, flink_cli_latency)` rather than the sum.
+---
 
 ## Data flow example
 
@@ -203,33 +280,32 @@ Given the demo topology:
 ol-datagen-orders-source  →  ol-raw-orders
 ol-enrich-orders          :  ol-raw-orders → ol-orders-enriched
 ol-high-value-alerts      :  ol-orders-enriched → ol-high-value-alerts
-ol-medium-risk-orders     :  ol-orders-enriched → ol-medium-risk-orders
 ol-http-sink              ←  ol-orders-enriched
+order-processor-service   ←  ol-orders-enriched  (consumer group)
+CSAS_HIGH_VALUE_STREAM_0  :  ol-orders-enriched → HIGH_VALUE_STREAM  (ksqlDB)
 ```
 
-The bridge emits 5 `RunEvent`s per cycle (one per job):
+The bridge emits 6 `RunEvent`s per cycle (one per job):
 
 ```json
-// ol-enrich-orders
+// Consumer group (inputs only — correct for a pure consumer)
 {
   "eventType": "COMPLETE",
-  "job": {"namespace": "flink://env-m2qxq", "name": "ol-enrich-orders"},
-  "inputs":  [{"namespace": "kafka://pkc-…:9092", "name": "ol-raw-orders"}],
-  "outputs": [{"namespace": "kafka://pkc-…:9092", "name": "ol-orders-enriched"}]
+  "job": {"namespace": "kafka-consumer-group://lkc-1j6rd3", "name": "order-processor-service"},
+  "inputs":  [{"namespace": "kafka://pkc-…:9092", "name": "ol-orders-enriched"}],
+  "outputs": null
 }
-```
 
-If `ol-high-value-alerts` is then deleted from Confluent Cloud, the next cycle emits:
-
-```json
+// ksqlDB query
 {
-  "eventType": "ABORT",
-  "job": {"namespace": "flink://env-m2qxq", "name": "ol-high-value-alerts"},
-  "run": {"runId": "..."}
+  "eventType": "COMPLETE",
+  "job": {"namespace": "ksqldb://lksqlc-xxxxx", "name": "CSAS_HIGH_VALUE_STREAM_0"},
+  "inputs":  [{"namespace": "kafka://pkc-…:9092", "name": "ol-orders-enriched"}],
+  "outputs": [{"namespace": "kafka://pkc-…:9092", "name": "HIGH_VALUE_STREAM"}]
 }
 ```
 
-Marquez marks the job inactive. Subsequent cycles emit 4 events, and `ol-high-value-alerts` does not appear again unless recreated.
+---
 
 ## Marquez deployment
 
@@ -239,25 +315,28 @@ Marquez requires PostgreSQL. The `docker-compose.yml` runs:
 2. `marquezproject/marquez:latest` — API on port 5000, admin on 5001
 3. `marquezproject/marquez-web:latest` — UI on port 3000
 
-Key configuration notes discovered during setup:
-- Marquez uses Dropwizard config with variable substitution. The correct env vars are `POSTGRES_HOST`/`POSTGRES_PORT` (not `MARQUEZ_DB_HOST` — that name is not recognised and causes the API to connect to `localhost:5432` inside the container, finding nothing).
-- Set `SEARCH_ENABLED=false` unless you also run OpenSearch — otherwise the API refuses to start.
-- The web container requires `WEB_PORT=3000` explicitly — it does not have a default and will exit without it.
-- The official images are `linux/amd64`. On Apple Silicon, OrbStack handles the emulation transparently via Rosetta. The platform mismatch warning is non-fatal.
+Key configuration notes:
+- Use `POSTGRES_HOST`/`POSTGRES_PORT` (not `MARQUEZ_DB_HOST` — unrecognised by Marquez)
+- Set `SEARCH_ENABLED=false` unless you also run OpenSearch
+- Set `WEB_PORT=3000` explicitly — it has no default and exits without it
+- Official images are `linux/amd64`; OrbStack on Apple Silicon handles emulation transparently
+
+---
 
 ## Known limitations
 
-- **Flink SQL parsing**: regex-based, covers `INSERT INTO` and `CREATE TABLE AS SELECT`. Complex patterns (CTEs, lateral joins, subqueries) may not parse correctly.
-- **Flink auth**: relies on the Confluent CLI being logged in. If the CLI session expires, `list_flink_statements()` returns an empty list and logs a warning — it does not crash.
-- **External sources/sinks**: connector source endpoints (e.g., the datagen internal source) and sink endpoints (e.g., httpbin.org) are omitted from the OpenLineage graph — only Kafka topics become Datasets.
-- **ksqlDB**: not yet supported. The Connect API approach would work for ksqlDB topics; SQL parsing would need extension.
-- **Schema lineage**: field-level lineage is not yet extracted from AVRO schemas.
-- **Flink REST API**: the regional Flink REST endpoint (`flink.<region>.aws.confluent.cloud/sql/v1`) requires user-level OAuth tokens that Cloud API keys cannot obtain. The CLI workaround is functional but ties availability to a logged-in CLI session.
+- **Producer identity**: No `client_id` dimension exists on any Confluent Metrics API broker metric. Individual producers cannot be identified from the cloud plane. Options: instrument producers directly with the OpenLineage SDK, or infer from Schema Registry (schema registrant ≈ likely writer).
+- **Flink SQL parsing**: Regex-based, covers `INSERT INTO` and `CREATE TABLE AS SELECT`. Complex patterns (CTEs, lateral joins, subqueries) may not parse correctly.
+- **Flink auth**: Relies on the Confluent CLI being logged in. If the CLI session expires, `list_flink_statements()` returns an empty list and logs a warning — it does not crash.
+- **Consumer group lookback**: Groups not seen within `CONFLUENT_METRICS_LOOKBACK_MINUTES` (default 10) are treated as inactive and removed from the graph. Increase the lookback for bursty consumers.
+- **ksqlDB source resolution**: If `SHOW STREAMS/TABLES EXTENDED` fails (auth error, timeout), source stream names fall back to their ksqlDB names rather than Kafka topic names.
+- **External sources/sinks**: Connector source endpoints (e.g., datagen internal source) and sink endpoints (e.g., httpbin.org) are omitted from the OpenLineage graph — only Kafka topics become Datasets.
+- **Field-level lineage**: Schema-level lineage (column → column mappings) is not yet extracted.
 
 ## Future work
 
-- Use Confluent CLI OAuth token to hit Flink REST directly (avoids subprocess dependency)
-- Add ksqlDB statement support
+- Use Confluent CLI OAuth token to hit Flink REST directly (removes subprocess dependency)
 - Extract field-level lineage from Schema Registry AVRO schemas — add `SchemaDatasetFacet` to Dataset nodes
+- Producer lineage via Schema Registry subject registration (schema registrant ≈ writer)
 - Support DataHub and OpenMetadata as explicit backends with per-backend transport config
 - Audit Log consumer as an alternative lineage source (event-driven rather than poll-based) for very large clusters

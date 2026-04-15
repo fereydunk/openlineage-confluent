@@ -56,15 +56,18 @@ class LineagePipeline:
         emitted, skipped, removed = self._emitter.emit_batch(events, force=force)
 
         stats = {
-            "cycle": self._cycle,
-            "connectors": summary["connectors"],
-            "flink_statements": summary["flink_statements"],
-            "edges": summary["edges"],
-            "events_mapped": len(events),
-            "events_emitted": emitted,
-            "events_skipped": skipped,
-            "events_removed": removed,
-            "fetch_ms": fetch_ms,
+            "cycle":                   self._cycle,
+            "managed_connectors":      summary["managed_connectors"],
+            "self_managed_connectors": summary["self_managed_connectors"],
+            "flink_statements":        summary["flink_statements"],
+            "consumer_groups":         summary["consumer_groups"],
+            "ksql_queries":            summary["ksql_queries"],
+            "edges":                   summary["edges"],
+            "events_mapped":           len(events),
+            "events_emitted":          emitted,
+            "events_skipped":          skipped,
+            "events_removed":          removed,
+            "fetch_ms":                fetch_ms,
         }
         log.info("Cycle #%d stats: %s", self._cycle, stats)
         return stats

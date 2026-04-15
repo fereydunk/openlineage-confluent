@@ -6,30 +6,89 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEFAULT_STATE_DB = Path.home() / ".openlineage-confluent" / "state.db"
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Nested config models (YAML-only, not env-var mapped)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class KsqlClusterConfig(BaseModel):
+    """Configuration for one Confluent Cloud ksqlDB cluster."""
+
+    cluster_id: str
+    rest_endpoint: str   # e.g. https://pksqlc-xxxxx.us-east-2.aws.confluent.cloud
+    api_key: str
+    api_secret: SecretStr
+
+
+class SelfManagedConnectClusterConfig(BaseModel):
+    """Configuration for one self-managed (on-prem / customer-hosted) Connect cluster."""
+
+    name: str            # unique label — used in namespace: kafka-connect://<name>
+    rest_endpoint: str   # e.g. http://connect-host:8083
+    username: str | None = None
+    password: SecretStr | None = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core settings classes
+# ──────────────────────────────────────────────────────────────────────────────
+
 class ConfluentConfig(BaseSettings):
-    """Confluent Cloud credentials and target identifiers."""
+    """Confluent Cloud credentials and topology identifiers."""
 
     model_config = SettingsConfigDict(env_prefix="CONFLUENT_", populate_by_name=True)
 
-    # Cloud-level API key (for api.confluent.cloud — not resource-specific)
+    # ── Required ─────────────────────────────────────────────────────────────
+
+    # Cloud-level API key (api.confluent.cloud — NOT Schema Registry or Kafka scoped)
     cloud_api_key: str = Field(..., alias="CONFLUENT_CLOUD_API_KEY")
     cloud_api_secret: SecretStr = Field(..., alias="CONFLUENT_CLOUD_API_SECRET")
 
-    # Confluent Cloud topology IDs
     environment_id: str = Field(..., alias="CONFLUENT_ENV_ID")
-    cluster_id: str = Field(..., alias="CONFLUENT_CLUSTER_ID")
+    cluster_id: str     = Field(..., alias="CONFLUENT_CLUSTER_ID")
 
-    # Regional Flink REST endpoint  (e.g. https://flink.us-west-2.aws.confluent.cloud)
-    # Find under: Confluent Cloud → Flink → Compute pool → REST endpoint
+    # ── Flink (CLI-based, REST URL stored for future direct access) ───────────
+
     flink_rest_url: str = Field(
         default="https://flink.us-west-2.aws.confluent.cloud",
         alias="CONFLUENT_FLINK_REST_URL",
+    )
+
+    # ── Metrics API ───────────────────────────────────────────────────────────
+    # Used to discover consumer group → topic mappings.
+    # If not set, falls back to cloud_api_key / cloud_api_secret.
+    # The key must have the MetricsViewer role at Environment or Org level.
+
+    metrics_api_key: str | None = Field(default=None, alias="CONFLUENT_METRICS_API_KEY")
+    metrics_api_secret: SecretStr | None = Field(
+        default=None, alias="CONFLUENT_METRICS_API_SECRET"
+    )
+
+    # How far back to look (minutes). Consumer groups active within this window
+    # appear in the lineage graph. Default 10 min covers a single poll cycle
+    # with headroom for Metrics API ingestion lag (~2-3 min).
+    metrics_lookback_minutes: int = Field(
+        default=10, alias="CONFLUENT_METRICS_LOOKBACK_MINUTES"
+    )
+
+    # Additional consumer group ID prefixes to exclude from lineage.
+    # Built-in exclusions: "_" prefix (Confluent-internal) and
+    # "confluent_cli_consumer_" prefix (CLI ad-hoc consumers).
+    consumer_group_exclude_prefixes: list[str] = Field(default_factory=list)
+
+    # ── ksqlDB clusters (list, YAML-only) ────────────────────────────────────
+
+    ksql_clusters: list[KsqlClusterConfig] = Field(default_factory=list)
+
+    # ── Self-managed Connect clusters (list, YAML-only) ──────────────────────
+
+    self_managed_connect_clusters: list[SelfManagedConnectClusterConfig] = Field(
+        default_factory=list
     )
 
 
@@ -38,14 +97,11 @@ class OpenLineageConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="OPENLINEAGE_", populate_by_name=True)
 
-    # Transport: "http" or "console"
     transport: Literal["http", "console"] = Field(default="http", alias="OPENLINEAGE_TRANSPORT")
-
-    # HTTP transport
     url: str = Field(default="http://localhost:5000", alias="OPENLINEAGE_URL")
     api_key: str | None = Field(default=None, alias="OPENLINEAGE_API_KEY")
 
-    # Kafka bootstrap — used as namespace for topic Datasets
+    # Kafka bootstrap — used as namespace for all topic Datasets
     kafka_bootstrap: str = Field(..., alias="OPENLINEAGE_KAFKA_BOOTSTRAP")
 
     producer: str = Field(
@@ -63,11 +119,9 @@ class PipelineConfig(BaseSettings):
     emit_full_refresh: bool = Field(default=False, alias="PIPELINE_FULL_REFRESH")
 
     # Number of parallel threads for event emission.
-    # Rule of thumb: 2× the number of CPU cores, capped at the rate limit of
-    # the OpenLineage backend. 8 is safe for Marquez; raise for DataHub.
     max_workers: int = Field(default=8, alias="PIPELINE_MAX_WORKERS")
 
-    # Path to the SQLite state database that persists known jobs across runs.
+    # SQLite state database path.
     state_db: Path = Field(default=_DEFAULT_STATE_DB, alias="PIPELINE_STATE_DB")
 
 

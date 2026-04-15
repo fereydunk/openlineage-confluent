@@ -1,58 +1,78 @@
 # openlineage-confluent
 
-Bridges **Confluent Cloud** stream lineage into the **[OpenLineage](https://openlineage.io)** standard, making your Kafka topology visible in observability tools like [Marquez](https://marquezproject.ai), DataHub, and OpenMetadata.
+Bridges **all** Confluent Cloud components into the **[OpenLineage](https://openlineage.io)** standard, making your full Kafka topology visible in observability tools like [Marquez](https://marquezproject.ai), DataHub, and OpenMetadata.
 
 ```
-Confluent Cloud                         OpenLineage backend
-──────────────────                      ────────────────────
-Connect API   ──┐                       ┌─ Marquez UI  (http://localhost:3000)
-Flink CLI     ──┼──▶  ol-confluent  ──▶─┤
-                │                       └─ DataHub / OpenMetadata / ...
-(poll every N seconds)
+Confluent Cloud                              OpenLineage backend
+──────────────────────────────               ────────────────────
+Managed Connect API    ──┐                   ┌─ Marquez UI  (http://localhost:3000)
+Flink CLI              ──┤                   │
+Metrics API (consumers)──┼──▶ ol-confluent ──▶─┤ DataHub
+ksqlDB REST API        ──┤                   │
+Self-managed Connect   ──┘                   └─ OpenMetadata / ...
+             (poll every N seconds)
 ```
 
-## What it does
+## What it covers
 
-Every poll cycle the bridge:
+Every poll cycle the bridge fetches from five sources **concurrently**:
 
-1. **Fetches connectors and Flink statements concurrently** — Connect REST API and Confluent CLI run in parallel threads to minimise fetch latency.
-2. **Parses Flink SQL** with a regex-based parser to extract `FROM`/`JOIN` inputs and `INSERT INTO`/`CREATE TABLE AS` outputs.
-3. **Builds a lineage graph** of `(source_topic → job → target_topic)` edges.
-4. **Diffs against the previous cycle** — each job's lineage is fingerprinted (SHA-256); unchanged jobs are skipped to avoid flooding the backend.
-5. **Detects removals** — jobs present in the previous cycle but absent in the current one receive a `RunState.ABORT` event so backends can mark them as inactive.
-6. **Emits RunEvents in parallel** — a configurable `ThreadPoolExecutor` saturates the backend's connection pool; one HTTP connection per worker thread.
-7. **Persists state across restarts** — known jobs and fingerprints are stored in a SQLite database (WAL mode) so removal detection survives process restarts.
+| Source | API | Components covered |
+|---|---|---|
+| **Managed Connect** | `api.confluent.cloud/connect/v1/…` | Confluent Cloud source and sink connectors |
+| **Flink SQL** | `confluent flink statement list -o json` | Cloud Flink persistent statements |
+| **Metrics API** | `api.telemetry.confluent.cloud/v2/metrics` | Any component committing Kafka offsets: application consumers, Kafka Streams, self-managed Connect workers |
+| **ksqlDB REST** | `POST {cluster}/ksql` — `SHOW QUERIES EXTENDED` | ksqlDB persistent queries (CSAS / CTAS) |
+| **Self-managed Connect** | `GET {endpoint}/connectors?expand=info,status` | On-prem or customer-hosted Connect clusters |
+
+Then each cycle:
+
+1. **Parses Flink SQL** — regex parser extracts `FROM`/`JOIN` inputs and `INSERT INTO`/`CREATE TABLE AS` outputs.
+2. **Resolves ksqlDB stream names to topics** — `SHOW STREAMS/TABLES EXTENDED` maps stream names to their underlying Kafka topics before building edges.
+3. **Filters internal consumer groups** — `_*` and `confluent_cli_consumer_*` groups (ksqlDB internals, Flink internals, CLI consumers) are excluded; application consumer groups remain.
+4. **Builds a lineage graph** — one `(source → job → target)` edge per data-flow relationship.
+5. **Diffs against the previous cycle** — each job's lineage is fingerprinted (SHA-256); unchanged jobs are skipped.
+6. **Detects removals** — jobs absent from the current cycle get a `RunState.ABORT` event so backends mark them inactive.
+7. **Emits RunEvents in parallel** — configurable `ThreadPoolExecutor`, one HTTP connection per thread.
+8. **Persists state across restarts** — SQLite (WAL mode) stores known jobs and fingerprints.
+
+## Namespace conventions
+
+| Confluent component | OL Job namespace | OL Job name | OL Dataset namespace |
+|---|---|---|---|
+| Managed connector | `kafka-connect://<env_id>` | `<connector_name>` | `kafka://<bootstrap>` |
+| Self-managed connector | `kafka-connect://<cluster_label>` | `<connector_name>` | `kafka://<bootstrap>` |
+| Flink statement | `flink://<env_id>` | `<statement_name>` | `kafka://<bootstrap>` |
+| Consumer group | `kafka-consumer-group://<cluster_id>` | `<group_id>` | `kafka://<bootstrap>` |
+| ksqlDB query | `ksqldb://<ksql_cluster_id>` | `<query_id>` | `kafka://<bootstrap>` |
 
 ## Live demo topology (DEVTEST cluster)
 
-The topology created for end-to-end validation:
-
 ```
-[ol-datagen-orders-source]          DatagenSource connector
+[ol-datagen-orders-source]    DatagenSource managed connector
         │
         ▼
-  ol-raw-orders                     Kafka topic (orders schema)
+  ol-raw-orders                Kafka topic
         │
-[ol-enrich-orders]                  Flink: flatten address, add risk_tier
+        ├──▶ [ol-enrich-orders]          Flink: flatten + add risk_tier
+        │           │
+        │     ol-orders-enriched         Kafka topic
+        │           │
+        │    ┌──────┼──────────────────────────────┐
+        │    ▼      ▼                               ▼
+        │  [ol-high-value-alerts]  [ol-medium-risk-orders]  [ol-http-sink]
+        │        (Flink)                 (Flink)           (HttpSink connector)
         │
-  ol-orders-enriched                Kafka topic (enriched orders)
-        │
-  ┌─────┼──────────────────────┐
-  ▼     ▼                      ▼
-[ol-high-value-alerts]  [ol-medium-risk-orders]  [ol-http-sink]
-  │                      │                        │
-  ol-high-value-alerts   ol-medium-risk-orders    httpbin.org
-  (HIGH risk only)       (MEDIUM risk only)       (HttpSink connector)
+        └──▶ [order-processor-service]   Consumer group (application)
+        └──▶ [CSAS_HIGH_VALUE_STREAM_0]  ksqlDB persistent query
 ```
-
-`ol-high-value-alerts` was used to demonstrate removal detection: deleting the Flink statement caused the bridge to emit a `RunState.ABORT` event on the next poll cycle, and Marquez updated accordingly.
 
 ## Prerequisites
 
 - Python 3.11+
-- [Confluent CLI](https://docs.confluent.io/confluent-cli/current/install.html) logged in (`confluent login`)
-- A Confluent Cloud environment with Connect connectors and/or Flink statements
-- Docker (or [OrbStack](https://orbstack.dev) on macOS) — for running Marquez locally
+- [Confluent CLI](https://docs.confluent.io/confluent-cli/current/install.html) logged in (`confluent login`) — required for Flink statement listing
+- A Confluent Cloud environment with at least one of: Connect connectors, Flink statements, consumer groups, or ksqlDB clusters
+- Docker or [OrbStack](https://orbstack.dev) — for running Marquez locally
 
 ## Quick start
 
@@ -69,10 +89,10 @@ pip install -e ".[dev]"
 
 ```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml with your Confluent Cloud credentials
+# Edit config.yaml with your credentials
 ```
 
-Key fields:
+Minimum required fields:
 
 | Field | Where to find it |
 |---|---|
@@ -92,17 +112,31 @@ make marquez-up
 ### 4. Run the bridge
 
 ```bash
-# One-shot: fetch and emit, then exit
-make run-once
-
-# Continuous: poll every 60 seconds
-make run
-
-# Validate only (no emit):
-make validate
+make validate   # Fetch and print lineage — no events emitted
+make run-once   # One fetch → map → emit cycle
+make run        # Continuous polling (Ctrl-C to stop)
 ```
 
-Open **http://localhost:3000**, search for any topic or job, and navigate the lineage graph.
+## Consumer group detection demo
+
+To verify that application consumer groups appear in the lineage graph:
+
+```bash
+# Install confluent-kafka
+pip install confluent-kafka
+
+# Provide a Kafka cluster-scoped API key
+# Create under: Confluent Cloud → Cluster → API Keys → Kafka cluster scoped
+export KAFKA_API_KEY=your-kafka-key
+export KAFKA_API_SECRET=your-kafka-secret
+
+# Produce and consume 20 messages using a named consumer group
+python scripts/producer_consumer_demo.py
+
+# Wait ~2-3 min for Metrics API ingestion, then validate
+make validate
+# Look for "ol-lineage-demo-consumer" in the lineage edges table
+```
 
 ## CLI reference
 
@@ -121,42 +155,67 @@ Options:
 
 ## Configuration reference
 
-All values can be set in `config.yaml` or as environment variables.
+All scalar values can be set in `config.yaml` or as environment variables.
+List values (`ksql_clusters`, `self_managed_connect_clusters`) are YAML-only.
 
-### `[confluent]`
-
-| Key | Env var | Description |
-|---|---|---|
-| `CONFLUENT_CLOUD_API_KEY` | `CONFLUENT_CLOUD_API_KEY` | Cloud-level API key (not resource-scoped) |
-| `CONFLUENT_CLOUD_API_SECRET` | `CONFLUENT_CLOUD_API_SECRET` | Corresponding secret |
-| `CONFLUENT_ENV_ID` | `CONFLUENT_ENV_ID` | Confluent environment ID (`env-…`) |
-| `CONFLUENT_CLUSTER_ID` | `CONFLUENT_CLUSTER_ID` | Kafka cluster ID (`lkc-…`) |
-| `CONFLUENT_FLINK_REST_URL` | `CONFLUENT_FLINK_REST_URL` | Regional Flink REST endpoint |
-
-### `[openlineage]`
+### `confluent`
 
 | Key | Env var | Default | Description |
 |---|---|---|---|
-| `OPENLINEAGE_TRANSPORT` | `OPENLINEAGE_TRANSPORT` | `http` | `http` or `console` |
-| `OPENLINEAGE_URL` | `OPENLINEAGE_URL` | `http://localhost:5000` | OpenLineage backend URL |
-| `OPENLINEAGE_API_KEY` | `OPENLINEAGE_API_KEY` | — | Backend API key (optional) |
-| `OPENLINEAGE_KAFKA_BOOTSTRAP` | `OPENLINEAGE_KAFKA_BOOTSTRAP` | — | Bootstrap servers (used as dataset namespace) |
-| `OPENLINEAGE_PRODUCER` | `OPENLINEAGE_PRODUCER` | `openlineage-confluent/0.1.0` | Producer identifier in events |
+| `CONFLUENT_CLOUD_API_KEY` | same | — | Cloud-level API key (not resource-scoped) |
+| `CONFLUENT_CLOUD_API_SECRET` | same | — | Corresponding secret |
+| `CONFLUENT_ENV_ID` | same | — | Environment ID (`env-…`) |
+| `CONFLUENT_CLUSTER_ID` | same | — | Kafka cluster ID (`lkc-…`) |
+| `CONFLUENT_FLINK_REST_URL` | same | `https://flink.us-west-2.aws.confluent.cloud` | Regional Flink REST endpoint (stored; CLI is used today) |
+| `CONFLUENT_METRICS_API_KEY` | same | *(cloud key)* | Optional dedicated Metrics API key (needs MetricsViewer role) |
+| `CONFLUENT_METRICS_API_SECRET` | same | *(cloud secret)* | Corresponding secret |
+| `CONFLUENT_METRICS_LOOKBACK_MINUTES` | same | `10` | Metrics API lookback window (minutes) |
+| `consumer_group_exclude_prefixes` | — | `[]` | Extra group ID prefixes to exclude from lineage |
+| `ksql_clusters` | — | `[]` | List of ksqlDB cluster configs (see below) |
+| `self_managed_connect_clusters` | — | `[]` | List of self-managed Connect cluster configs (see below) |
 
-### `[pipeline]`
+**ksqlDB cluster entry:**
+```yaml
+ksql_clusters:
+  - cluster_id:    "lksqlc-xxxxxx"
+    rest_endpoint: "https://pksqlc-xxxxxx.<region>.aws.confluent.cloud"
+    api_key:       "KSQLAPIKEY"
+    api_secret:    "ksql-api-secret"
+```
+
+**Self-managed Connect entry:**
+```yaml
+self_managed_connect_clusters:
+  - name:          "on-prem-etl"       # used in namespace: kafka-connect://on-prem-etl
+    rest_endpoint: "http://connect-host:8083"
+    username:      "admin"             # optional
+    password:      "secret"           # optional
+```
+
+### `openlineage`
 
 | Key | Env var | Default | Description |
 |---|---|---|---|
-| `PIPELINE_POLL_INTERVAL` | `PIPELINE_POLL_INTERVAL` | `60` | Seconds between poll cycles |
-| `PIPELINE_FULL_REFRESH` | `PIPELINE_FULL_REFRESH` | `false` | Re-emit all events every cycle (useful after backend restart) |
-| `PIPELINE_MAX_WORKERS` | `PIPELINE_MAX_WORKERS` | `8` | Parallel threads for event emission — raise for DataHub, 8 is safe for Marquez |
-| `PIPELINE_STATE_DB` | `PIPELINE_STATE_DB` | `~/.openlineage-confluent/state.db` | SQLite database path for persisting known jobs across restarts |
+| `OPENLINEAGE_TRANSPORT` | same | `http` | `http` or `console` |
+| `OPENLINEAGE_URL` | same | `http://localhost:5000` | OpenLineage backend URL |
+| `OPENLINEAGE_API_KEY` | same | — | Backend API key (optional) |
+| `OPENLINEAGE_KAFKA_BOOTSTRAP` | same | — | Bootstrap servers (used as dataset namespace) |
+| `OPENLINEAGE_PRODUCER` | same | `openlineage-confluent/0.1.0` | Producer identifier in events |
+
+### `pipeline`
+
+| Key | Env var | Default | Description |
+|---|---|---|---|
+| `PIPELINE_POLL_INTERVAL` | same | `60` | Seconds between poll cycles |
+| `PIPELINE_FULL_REFRESH` | same | `false` | Re-emit all events every cycle |
+| `PIPELINE_MAX_WORKERS` | same | `8` | Parallel threads for event emission |
+| `PIPELINE_STATE_DB` | same | `~/.openlineage-confluent/state.db` | SQLite state database |
 
 ## Removal detection
 
-When a connector or Flink statement disappears from Confluent Cloud (deleted, stopped, or renamed), the bridge detects this by diffing the current graph against the previous cycle's persisted state.
+When any component disappears (connector deleted, Flink statement stopped, consumer group inactive, ksqlDB query dropped), the bridge detects this by diffing the current graph against the persisted previous-cycle state.
 
-For each missing job the bridge emits a `RunState.ABORT` event:
+For each removed job the bridge emits a `RunState.ABORT` event:
 
 ```json
 {
@@ -166,33 +225,34 @@ For each missing job the bridge emits a `RunState.ABORT` event:
 }
 ```
 
-This tells Marquez (or any OpenLineage-compatible backend) to mark the job as no longer active. The job is then removed from the known-jobs list, so it will not be reported again unless it reappears.
-
-State is persisted in SQLite so removal detection works correctly even after a process restart — a job seen in cycle N and missing in cycle N+1 triggers an ABORT regardless of whether the process restarted between the two cycles.
+State is persisted in SQLite so removal detection works across process restarts.
 
 ## Development
 
 ```bash
-make test        # run pytest (55 tests, all offline — no credentials required)
+make test        # 108 tests, all offline — no credentials required
 make lint        # ruff
 make type-check  # mypy
 ```
 
 ## Scripts
 
-The `scripts/` directory contains the Flink SQL and AVRO schemas used to build the demo topology:
-
 | File | Purpose |
 |---|---|
-| `connector-datagen-orders.json` | DatagenSource connector config |
+| `producer_consumer_demo.py` | Produces and consumes messages using a named consumer group — use to verify Metrics API consumer lineage detection |
+| `connector-datagen-orders.json` | DatagenSource connector config for DEVTEST topology |
 | `connector-http-sink.json` | HttpSink connector config |
-| `connector-dummy-sink.json` | Minimal DummySink config (used for bulk removal detection demo) |
+| `connector-dummy-sink.json` | Minimal DummySink (used for bulk removal detection demo) |
+| `flink-enrich-orders.sql` | Flink: flatten address, add risk_tier |
+| `flink-high-value-alerts.sql` | Flink: filter HIGH risk orders |
+| `flink-medium-risk-orders.sql` | Flink: filter MEDIUM risk orders |
 | `schema-orders-enriched.avsc` | AVRO schema for `ol-orders-enriched` |
 | `schema-high-value-alerts.avsc` | AVRO schema for `ol-high-value-alerts` |
 | `schema-medium-risk-orders.avsc` | AVRO schema for `ol-medium-risk-orders` |
-| `flink-enrich-orders.sql` | Flink statement: flatten address + add risk_tier |
-| `flink-high-value-alerts.sql` | Flink statement: filter HIGH risk orders |
-| `flink-medium-risk-orders.sql` | Flink statement: filter MEDIUM risk orders |
+| `stress_test.py` | 2-hour scale test: 3 envs × 100 pipelines × 20 components, with random mutations and Marquez verification |
+| `diagnose_catalog.py` | Investigation script for the Confluent Stream Catalog Atlas API (determined unusable for operational lineage) |
+| `diagnose_lineage_api.py` | Follow-up investigation of the `/catalog/v1/lineage/` endpoint |
+| `diagnose_real_types.py` | Atlas entity type enumeration script |
 
 ## License
 
