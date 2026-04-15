@@ -4,6 +4,7 @@ Wraps openlineage-python's transport layer and adds:
   - console transport for local debugging
   - diff tracking (only emit changed job lineages)
   - removal detection (ABORT event when a job disappears from the graph)
+  - state persistence across runs (so run-once can detect removals)
   - structured logging
 """
 
@@ -14,6 +15,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from openlineage.client import OpenLineageClient
 from openlineage.client.event_v2 import Job, Run, RunEvent, RunState
@@ -23,6 +25,9 @@ from openlineage.client.transport.console import ConsoleConfig, ConsoleTransport
 from openlineage_confluent.config import OpenLineageConfig
 
 log = logging.getLogger(__name__)
+
+# Default state file location — persists known-jobs across process restarts.
+DEFAULT_STATE_FILE = Path.home() / ".openlineage-confluent" / "state.json"
 
 
 def _event_fingerprint(event: RunEvent) -> str:
@@ -39,15 +44,58 @@ def _event_fingerprint(event: RunEvent) -> str:
 
 
 class LineageEmitter:
-    """Thin wrapper around OpenLineageClient with diff-tracking and removal detection."""
+    """Thin wrapper around OpenLineageClient with diff-tracking and removal detection.
 
-    def __init__(self, cfg: OpenLineageConfig) -> None:
+    State (known jobs + fingerprints) is persisted to *state_file* after every
+    emit_batch() call, so that run-once invocations across restarts can still
+    detect when a job has been removed from Confluent Cloud.
+    """
+
+    def __init__(
+        self,
+        cfg: OpenLineageConfig,
+        *,
+        state_file: Path = DEFAULT_STATE_FILE,
+    ) -> None:
         self._cfg = cfg
         self._client = self._build_client(cfg)
-        self._last_fingerprints: dict[str, str] = {}
-        # Tracks every job seen so far: job_key → (namespace, name)
-        # Used to detect jobs that have disappeared from the lineage graph.
+        self._state_file = state_file
+
+        # Persisted across runs: job_key → (namespace, name)
         self._known_jobs: dict[str, tuple[str, str]] = {}
+        # Persisted across runs: job_key → last-emitted fingerprint
+        self._last_fingerprints: dict[str, str] = {}
+
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Restore known-jobs and fingerprints from the state file if it exists."""
+        if not self._state_file.exists():
+            return
+        try:
+            raw = json.loads(self._state_file.read_text())
+            self._known_jobs = {k: tuple(v) for k, v in raw.get("known_jobs", {}).items()}  # type: ignore[misc]
+            self._last_fingerprints = raw.get("fingerprints", {})
+            log.debug("Loaded state: %d known jobs from %s",
+                      len(self._known_jobs), self._state_file)
+        except Exception:
+            log.warning("Could not load state file %s — starting fresh", self._state_file)
+
+    def _save_state(self) -> None:
+        """Persist current known-jobs and fingerprints to the state file."""
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "known_jobs": {k: list(v) for k, v in self._known_jobs.items()},
+                "fingerprints": self._last_fingerprints,
+            }
+            self._state_file.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            log.warning("Could not save state file %s", self._state_file)
 
     # ------------------------------------------------------------------
     # Client factory
@@ -104,6 +152,7 @@ class LineageEmitter:
 
         Removal detection: any job previously seen that is absent from *events*
         receives an ABORT RunEvent so the backend can mark it as gone.
+        State is persisted to disk after every call.
         """
         current_keys = {f"{e.job.namespace}/{e.job.name}" for e in events}
 
@@ -120,6 +169,8 @@ class LineageEmitter:
                 emitted += 1
             else:
                 skipped += 1
+
+        self._save_state()
 
         log.info("Batch complete — emitted=%d skipped=%d removed=%d",
                  emitted, skipped, len(removed_keys))
@@ -141,6 +192,8 @@ class LineageEmitter:
             log.exception("Failed to emit removal event for %s/%s", namespace, name)
 
     def reset_state(self) -> None:
-        """Clear all diff state — next emit_batch will send everything fresh."""
+        """Clear all diff state and delete the state file."""
         self._last_fingerprints.clear()
         self._known_jobs.clear()
+        if self._state_file.exists():
+            self._state_file.unlink()
