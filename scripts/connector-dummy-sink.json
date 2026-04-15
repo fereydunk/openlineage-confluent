@@ -1,0 +1,9 @@
+{
+  "name": "ol-dummy-sink",
+  "config": {
+    "connector.class": "DummySink",
+    "name": "ol-dummy-sink",
+    "topics": "ol-orders-enriched",
+    "tasks.max": "1"
+  }
+}
