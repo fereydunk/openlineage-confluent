@@ -31,7 +31,7 @@ import java.util.UUID;
  */
 public class OrderProducer {
 
-    private static final String JOB_NAMESPACE = "java-app://order-service";
+    private static final String JOB_NAMESPACE = "kafka-producer://order-service";
     private static final String JOB_NAME      = "order-producer";
 
     public static void main(String[] args) throws Exception {
@@ -62,7 +62,7 @@ public class OrderProducer {
         // JobTypeJobFacet makes the job recognisable in Marquez as a Kafka producer
         OpenLineage.JobFacets jobFacets = ol.newJobFacetsBuilder()
                 .jobType(ol.newJobTypeJobFacetBuilder()
-                        .processingType("BATCH")
+                        .processingType("STREAMING")
                         .integration("KAFKA")
                         .jobType("PRODUCER")
                         .build())
