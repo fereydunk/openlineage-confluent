@@ -32,6 +32,15 @@ from openlineage_confluent.confluent.models import (
     KsqlQuery,
     LineageEdge,
     LineageGraph,
+    TopicThroughput,
+)
+from openlineage_confluent.confluent.kafka_rest_client import (
+    KafkaRestClient,
+    TopicMetadata,
+)
+from openlineage_confluent.confluent.schema_registry_client import (
+    SchemaRegistryClient,
+    TopicSchema,
 )
 from openlineage_confluent.confluent.self_managed_connect_client import SelfManagedConnectClient
 from openlineage_confluent.confluent.sql_parser import parse_statement
@@ -68,6 +77,29 @@ class ConfluentLineageClient:
             SelfManagedConnectClient(cluster, timeout=timeout)
             for cluster in cfg.self_managed_connect_clusters
         ]
+
+        # Schema Registry client — optional. When unset, topic Datasets are
+        # emitted without a SchemaDatasetFacet.
+        self._sr_client: SchemaRegistryClient | None = None
+        if cfg.schema_registry is not None:
+            self._sr_client = SchemaRegistryClient(
+                endpoint=cfg.schema_registry.endpoint,
+                api_key=cfg.schema_registry.api_key,
+                api_secret=cfg.schema_registry.api_secret.get_secret_value(),
+                timeout=timeout,
+            )
+
+        # Kafka REST client — optional. When unset, topic Datasets are emitted
+        # without a KafkaTopicDatasetFacet (partition / replication info).
+        self._kafka_rest: KafkaRestClient | None = None
+        if cfg.kafka_rest_endpoint and cfg.kafka_api_key and cfg.kafka_api_secret:
+            self._kafka_rest = KafkaRestClient(
+                endpoint=cfg.kafka_rest_endpoint,
+                cluster_id=cfg.cluster_id,
+                api_key=cfg.kafka_api_key,
+                api_secret=cfg.kafka_api_secret.get_secret_value(),
+                timeout=timeout,
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Managed Connect
@@ -165,13 +197,19 @@ class ConfluentLineageClient:
         cluster = self._cfg.cluster_id
 
         # Submit all concurrent fetches
-        n_workers = 3 + len(self._ksql_clients) + len(self._sm_connect_clients)
+        n_workers = 5 + len(self._ksql_clients) + len(self._sm_connect_clients)
         futures: dict[str, Any] = {}
 
         with ThreadPoolExecutor(max_workers=max(n_workers, 4)) as pool:
-            futures["connectors"]      = pool.submit(self.list_connectors)
-            futures["statements"]      = pool.submit(self.list_flink_statements)
-            futures["consumer_groups"] = pool.submit(self._metrics.get_consumer_groups)
+            futures["connectors"]       = pool.submit(self.list_connectors)
+            futures["statements"]       = pool.submit(self.list_flink_statements)
+            futures["consumer_groups"]  = pool.submit(self._metrics.get_consumer_groups)
+            futures["topic_throughput"] = pool.submit(self._metrics.get_topic_throughput)
+
+            if self._kafka_rest is not None:
+                futures["topic_metadata"] = pool.submit(
+                    self._kafka_rest.get_topic_metadata
+                )
 
             for kc in self._ksql_clients:
                 futures[f"ksql:{kc._cluster.cluster_id}"] = pool.submit(kc.get_queries)
@@ -300,12 +338,46 @@ class ConfluentLineageClient:
             len(consumer_groups), len(ksql_queries),
         )
 
+        # ── 5. Schema Registry: fetch key+value schema for every topic in graph ─
+        topic_schemas: dict[str, TopicSchema] = {}
+        if self._sr_client is not None:
+            topics = sorted({
+                ep for e in edges
+                for ep in (
+                    (e.source_name,) if e.source_type == "kafka_topic" else ()
+                ) + (
+                    (e.target_name,) if e.target_type == "kafka_topic" else ()
+                )
+            })
+            try:
+                topic_schemas = self._sr_client.get_topic_schemas(topics)
+            except Exception as exc:    # noqa: BLE001 — never let SR break the graph
+                log.warning("Schema Registry fetch failed (continuing without schemas): %s", exc)
+
+        # ── 6. Kafka REST: per-topic partition / replication metadata ─────────
+        topic_metadata: dict[str, TopicMetadata] = {}
+        if self._kafka_rest is not None:
+            try:
+                topic_metadata = futures["topic_metadata"].result()
+            except Exception as exc:    # noqa: BLE001
+                log.warning("Kafka REST fetch failed (continuing without metadata): %s", exc)
+
+        # ── 7. Metrics API: per-topic throughput over lookback window ─────────
+        topic_throughput: dict[str, TopicThroughput] = {}
+        try:
+            topic_throughput = futures["topic_throughput"].result()
+        except Exception as exc:    # noqa: BLE001
+            log.warning("Topic throughput fetch failed (continuing without): %s", exc)
+
         return LineageGraph(
             edges=edges,
             connectors=all_connectors,
             statements=statements,
             consumer_groups=consumer_groups,
             ksql_queries=ksql_queries,
+            topic_schemas=topic_schemas,
+            topic_metadata=topic_metadata,
+            topic_throughput=topic_throughput,
         )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -319,6 +391,10 @@ class ConfluentLineageClient:
             c.close()
         for c in self._sm_connect_clients:
             c.close()
+        if self._sr_client is not None:
+            self._sr_client.close()
+        if self._kafka_rest is not None:
+            self._kafka_rest.close()
 
     def __enter__(self) -> "ConfluentLineageClient":
         return self

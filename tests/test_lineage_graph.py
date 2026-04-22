@@ -133,6 +133,27 @@ def test_consumer_group_empty_topics() -> None:
     assert group.topics == []
 
 
+# ── FlinkStatement ────────────────────────────────────────────────────────────
+
+def test_flink_statement_running_is_active(sample_flink_statement) -> None:
+    assert sample_flink_statement.is_running() is True
+
+
+def test_flink_statement_stopped_is_active() -> None:
+    s = FlinkStatement(name="x", statement="INSERT INTO a SELECT 1", status="STOPPED", compute_pool="p")
+    assert s.is_running() is True
+
+
+def test_flink_statement_failed_is_not_active() -> None:
+    s = FlinkStatement(name="x", statement="INSERT INTO a SELECT 1", status="FAILED", compute_pool="p")
+    assert s.is_running() is False
+
+
+def test_flink_statement_completed_is_not_active() -> None:
+    s = FlinkStatement(name="x", statement="INSERT INTO a SELECT 1", status="COMPLETED", compute_pool="p")
+    assert s.is_running() is False
+
+
 # ── KsqlQuery ─────────────────────────────────────────────────────────────────
 
 def test_ksql_query_is_running(sample_ksql_query) -> None:

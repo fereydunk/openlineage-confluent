@@ -10,10 +10,31 @@ Lineage is assembled from five sources:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from openlineage_confluent.confluent.kafka_rest_client import TopicMetadata
+from openlineage_confluent.confluent.schema_registry_client import TopicSchema
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-topic throughput  (defined here to avoid a circular import between
+# metrics_client.py and models.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TopicThroughput:
+    """Per-topic throughput totals over the metrics lookback window."""
+
+    topic: str
+    bytes_in: int = 0       # received_bytes
+    bytes_out: int = 0      # sent_bytes
+    records_in: int = 0     # received_records
+    records_out: int = 0    # sent_records
+    window_minutes: int = 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -77,7 +98,9 @@ class FlinkStatement(BaseModel):
     model_config = {"populate_by_name": True}
 
     def is_running(self) -> bool:
-        return self.status.upper() == "RUNNING"
+        # Include STOPPED (deployed but paused) so lineage reflects the full
+        # deployed topology, not just what's actively streaming right now.
+        return self.status.upper() in ("RUNNING", "STOPPED")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -150,6 +173,9 @@ class LineageEdge(BaseModel):
 class LineageGraph(BaseModel):
     """Complete lineage graph built from all sources in one poll cycle."""
 
+    # TopicSchema is a non-pydantic dataclass; allow it as a field value.
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     edges: list[LineageEdge] = Field(default_factory=list)
 
     # Constituent source objects (kept for summary and debugging)
@@ -157,6 +183,15 @@ class LineageGraph(BaseModel):
     statements: list[FlinkStatement] = Field(default_factory=list)
     consumer_groups: list[ConsumerGroupInfo] = Field(default_factory=list)
     ksql_queries: list[KsqlQuery] = Field(default_factory=list)
+
+    # topic name → resolved key/value schemas (empty if SR not configured)
+    topic_schemas: dict[str, TopicSchema] = Field(default_factory=dict)
+
+    # topic name → partition count + replication factor (empty if Kafka REST not configured)
+    topic_metadata: dict[str, TopicMetadata] = Field(default_factory=dict)
+
+    # topic name → throughput over the metrics lookback window
+    topic_throughput: dict[str, TopicThroughput] = Field(default_factory=dict)
 
     def summary(self) -> dict[str, int]:
         managed  = sum(1 for c in self.connectors if c.connect_cluster is None)
@@ -168,4 +203,7 @@ class LineageGraph(BaseModel):
             "consumer_groups":         len(self.consumer_groups),
             "ksql_queries":            len(self.ksql_queries),
             "edges":                   len(self.edges),
+            "topics_with_schema":      len(self.topic_schemas),
+            "topics_with_metadata":    len(self.topic_metadata),
+            "topics_with_throughput":  len(self.topic_throughput),
         }

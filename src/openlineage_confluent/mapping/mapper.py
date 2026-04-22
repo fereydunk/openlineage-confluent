@@ -27,10 +27,16 @@ from openlineage.client.event_v2 import (
     RunEvent,
     RunState,
 )
-from openlineage.client.facet_v2 import documentation_job, ownership_job
+from openlineage.client.facet_v2 import documentation_job, ownership_job, schema_dataset
 
-from openlineage_confluent.confluent.models import LineageEdge, LineageGraph
+from openlineage_confluent.confluent.kafka_rest_client import TopicMetadata
+from openlineage_confluent.confluent.models import LineageEdge, LineageGraph, TopicThroughput
+from openlineage_confluent.confluent.schema_registry_client import SchemaField, TopicSchema
 from openlineage_confluent.config import ConfluentConfig, OpenLineageConfig
+from openlineage_confluent.mapping.facets import (
+    KafkaTopicDatasetFacet,
+    KafkaTopicThroughputDatasetFacet,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +82,9 @@ class ConfluentOpenLineageMapper:
                 edges=edges,
                 event_time=now,
                 cycle_key=cycle_key,
+                topic_schemas=graph.topic_schemas,
+                topic_metadata=graph.topic_metadata,
+                topic_throughput=graph.topic_throughput,
             )
             events.append(event)
 
@@ -94,6 +103,9 @@ class ConfluentOpenLineageMapper:
         edges: list[LineageEdge],
         event_time: datetime,
         cycle_key: str,
+        topic_schemas: dict[str, TopicSchema],
+        topic_metadata: dict[str, TopicMetadata],
+        topic_throughput: dict[str, TopicThroughput],
     ) -> RunEvent:
         job = Job(namespace=ns_hint, name=job_name)
         run = Run(runId=_stable_run_id(ns_hint, job_name, cycle_key))
@@ -108,13 +120,17 @@ class ConfluentOpenLineageMapper:
             # Source side
             src_key = f"{edge.source_type}:{edge.source_name}"
             if src_key not in seen_inputs and edge.source_type == "kafka_topic":
-                inputs.append(self._make_input(edge.source_name))
+                inputs.append(self._make_input(
+                    edge.source_name, topic_schemas, topic_metadata, topic_throughput,
+                ))
                 seen_inputs.add(src_key)
 
             # Target side
             tgt_key = f"{edge.target_type}:{edge.target_name}"
             if tgt_key not in seen_outputs and edge.target_type == "kafka_topic":
-                outputs.append(self._make_output(edge.target_name))
+                outputs.append(self._make_output(
+                    edge.target_name, topic_schemas, topic_metadata, topic_throughput,
+                ))
                 seen_outputs.add(tgt_key)
 
         return RunEvent(
@@ -134,8 +150,99 @@ class ConfluentOpenLineageMapper:
     def _kafka_namespace(self) -> str:
         return f"kafka://{self._ol.kafka_bootstrap}"
 
-    def _make_input(self, topic: str) -> InputDataset:
-        return InputDataset(namespace=self._kafka_namespace(), name=topic)
+    def _make_input(
+        self,
+        topic: str,
+        topic_schemas: dict[str, TopicSchema],
+        topic_metadata: dict[str, TopicMetadata],
+        topic_throughput: dict[str, TopicThroughput],
+    ) -> InputDataset:
+        return InputDataset(
+            namespace=self._kafka_namespace(),
+            name=topic,
+            facets=self._dataset_facets(topic, topic_schemas, topic_metadata, topic_throughput),
+        )
 
-    def _make_output(self, topic: str) -> OutputDataset:
-        return OutputDataset(namespace=self._kafka_namespace(), name=topic)
+    def _make_output(
+        self,
+        topic: str,
+        topic_schemas: dict[str, TopicSchema],
+        topic_metadata: dict[str, TopicMetadata],
+        topic_throughput: dict[str, TopicThroughput],
+    ) -> OutputDataset:
+        return OutputDataset(
+            namespace=self._kafka_namespace(),
+            name=topic,
+            facets=self._dataset_facets(topic, topic_schemas, topic_metadata, topic_throughput),
+        )
+
+    # ------------------------------------------------------------------
+    # Facet builders
+    # ------------------------------------------------------------------
+
+    def _dataset_facets(
+        self,
+        topic: str,
+        topic_schemas: dict[str, TopicSchema],
+        topic_metadata: dict[str, TopicMetadata],
+        topic_throughput: dict[str, TopicThroughput],
+    ) -> dict | None:
+        """Return the facet dict for a topic Dataset, or None if no facets apply."""
+        facets: dict = {}
+
+        ts = topic_schemas.get(topic)
+        if ts is not None:
+            schema = self._schema_facet(ts)
+            if schema is not None:
+                facets["schema"] = schema
+
+        tm = topic_metadata.get(topic)
+        if tm is not None:
+            facets["kafkaTopic"] = KafkaTopicDatasetFacet(
+                partitions=tm.partitions,
+                replicationFactor=tm.replication_factor,
+                isInternal=tm.is_internal,
+            )
+
+        tp = topic_throughput.get(topic)
+        if tp is not None:
+            facets["kafkaThroughput"] = KafkaTopicThroughputDatasetFacet(
+                bytesIn=tp.bytes_in,
+                bytesOut=tp.bytes_out,
+                recordsIn=tp.records_in,
+                recordsOut=tp.records_out,
+                windowMinutes=tp.window_minutes,
+            )
+
+        return facets or None
+
+    def _schema_facet(self, ts: TopicSchema) -> schema_dataset.SchemaDatasetFacet | None:
+        """Combine key + value schemas into one SchemaDatasetFacet.
+
+        Kafka has two independent schemas per record (key, value); OpenLineage's
+        SchemaDatasetFacet only models a single field list. We render both as
+        prefixed top-level fields:
+          key.<field>      — fields from the key subject
+          value.<field>    — fields from the value subject
+        """
+        all_fields: list[schema_dataset.SchemaDatasetFacetFields] = []
+        for prefix, sf_list in (("key", ts.key_fields), ("value", ts.value_fields)):
+            for sf in sf_list:
+                all_fields.append(_to_ol_field(sf, name_prefix=f"{prefix}."))
+
+        if not all_fields:
+            return None
+        return schema_dataset.SchemaDatasetFacet(fields=all_fields)
+
+
+def _to_ol_field(
+    sf: SchemaField, *, name_prefix: str = "",
+) -> schema_dataset.SchemaDatasetFacetFields:
+    """Convert internal SchemaField → OpenLineage SchemaDatasetFacetFields."""
+    nested = [_to_ol_field(child) for child in sf.fields] if sf.fields else None
+    return schema_dataset.SchemaDatasetFacetFields(
+        name=f"{name_prefix}{sf.name}",
+        type=sf.type,
+        description=sf.description,
+        fields=nested,
+    )

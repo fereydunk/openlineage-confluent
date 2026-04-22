@@ -176,3 +176,89 @@ def test_uses_cloud_key_as_fallback(cfg) -> None:
     c = MetricsApiClient(cfg)
     # The httpx auth tuple should use the cloud key
     assert c._http.auth is not None
+
+
+# ── get_topic_throughput ──────────────────────────────────────────────────────
+
+def _throughput_responses(by_metric: dict[str, list[dict]]) -> list[MagicMock]:
+    """Build one MagicMock per call to client._http.post in metric order:
+    received_bytes, sent_bytes, received_records, sent_records.
+    """
+    from openlineage_confluent.confluent.metrics_client import (
+        _RECEIVED_BYTES, _SENT_BYTES, _RECEIVED_RECORDS, _SENT_RECORDS,
+    )
+    order = [_RECEIVED_BYTES, _SENT_BYTES, _RECEIVED_RECORDS, _SENT_RECORDS]
+    return [_mock_metrics_response(by_metric.get(m, [])) for m in order]
+
+
+def test_get_topic_throughput_aggregates_all_four_metrics(client) -> None:
+    responses = _throughput_responses({
+        "io.confluent.kafka.server/received_bytes": [
+            {"metric.topic": "orders",   "value": 1024},
+            {"metric.topic": "payments", "value":  512},
+        ],
+        "io.confluent.kafka.server/sent_bytes": [
+            {"metric.topic": "orders", "value": 2048},
+        ],
+        "io.confluent.kafka.server/received_records": [
+            {"metric.topic": "orders",   "value": 100},
+            {"metric.topic": "payments", "value":  50},
+        ],
+        "io.confluent.kafka.server/sent_records": [
+            {"metric.topic": "orders", "value": 200},
+        ],
+    })
+    with patch.object(client._http, "post", side_effect=responses):
+        out = client.get_topic_throughput()
+
+    assert set(out) == {"orders", "payments"}
+    assert out["orders"].bytes_in    == 1024
+    assert out["orders"].bytes_out   == 2048
+    assert out["orders"].records_in  == 100
+    assert out["orders"].records_out == 200
+    assert out["payments"].bytes_in  == 512
+    assert out["payments"].bytes_out == 0
+    assert out["payments"].records_out == 0
+
+
+def test_get_topic_throughput_carries_window_minutes(client) -> None:
+    responses = _throughput_responses({
+        "io.confluent.kafka.server/received_bytes": [
+            {"metric.topic": "t", "value": 1},
+        ],
+    })
+    with patch.object(client._http, "post", side_effect=responses):
+        out = client.get_topic_throughput()
+    assert out["t"].window_minutes == 10  # default lookback
+
+
+def test_get_topic_throughput_skips_rows_without_topic(client) -> None:
+    responses = _throughput_responses({
+        "io.confluent.kafka.server/received_bytes": [
+            {"value": 1},                  # no topic
+            {"metric.topic": "good", "value": 2},
+        ],
+    })
+    with patch.object(client._http, "post", side_effect=responses):
+        out = client.get_topic_throughput()
+    assert list(out) == ["good"]
+
+
+def test_get_topic_throughput_partial_failure_returns_what_succeeded(client) -> None:
+    """If one metric query fails, the other three should still aggregate."""
+    import httpx
+    good_resp = _mock_metrics_response([{"metric.topic": "t", "value": 5}])
+
+    def side_effect(*args, **kwargs):
+        # Fail the second call (sent_bytes), succeed the others
+        side_effect.calls = getattr(side_effect, "calls", 0) + 1
+        if side_effect.calls == 2:
+            raise httpx.HTTPError("boom")
+        return good_resp
+
+    with patch.object(client._http, "post", side_effect=side_effect):
+        out = client.get_topic_throughput()
+    assert out["t"].bytes_in == 5      # received_bytes succeeded
+    assert out["t"].bytes_out == 0     # sent_bytes failed
+    assert out["t"].records_in == 5    # received_records succeeded
+    assert out["t"].records_out == 5   # sent_records succeeded

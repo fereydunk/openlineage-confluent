@@ -25,6 +25,18 @@ class KsqlClusterConfig(BaseModel):
     api_secret: SecretStr
 
 
+class SchemaRegistryConfig(BaseModel):
+    """Configuration for the Confluent Schema Registry cluster.
+
+    SR uses its own API key scope — Cloud-level API keys do NOT work here.
+    Generate the key from Confluent Cloud → Environment → Schema Registry.
+    """
+
+    endpoint: str               # e.g. https://psrc-xxxxx.us-east-2.aws.confluent.cloud
+    api_key: str
+    api_secret: SecretStr
+
+
 class SelfManagedConnectClusterConfig(BaseModel):
     """Configuration for one self-managed (on-prem / customer-hosted) Connect cluster."""
 
@@ -80,6 +92,23 @@ class ConfluentConfig(BaseSettings):
     # Built-in exclusions: "_" prefix (Confluent-internal) and
     # "confluent_cli_consumer_" prefix (CLI ad-hoc consumers).
     consumer_group_exclude_prefixes: list[str] = Field(default_factory=list)
+
+    # ── Schema Registry (optional — if unset, SchemaDatasetFacet is omitted) ─
+
+    schema_registry: SchemaRegistryConfig | None = None
+
+    # ── Kafka REST API (optional — if unset, KafkaTopicDatasetFacet is omitted) ─
+    # Used to fetch per-topic partition count + replication factor.
+    # Endpoint is the cluster-scoped REST endpoint; auth uses a Kafka API key
+    # (cluster-scoped, NOT a Cloud-level key).
+
+    kafka_rest_endpoint: str | None = Field(
+        default=None, alias="CONFLUENT_KAFKA_REST_ENDPOINT"
+    )
+    kafka_api_key: str | None = Field(default=None, alias="CONFLUENT_KAFKA_API_KEY")
+    kafka_api_secret: SecretStr | None = Field(
+        default=None, alias="CONFLUENT_KAFKA_API_SECRET"
+    )
 
     # ── ksqlDB clusters (list, YAML-only) ────────────────────────────────────
 

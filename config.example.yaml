@@ -40,6 +40,34 @@ confluent:
   #   - "legacy-internal-"
   #   - "test-"
 
+  # ── Kafka REST API (optional) ─────────────────────────────────────────────────
+  # When configured, every topic Dataset carries a custom KafkaTopicDatasetFacet
+  # with partition count + replication factor + isInternal flag (mirrors what
+  # Confluent Stream Lineage shows on a topic node).
+  #
+  # Endpoint is the cluster-scoped REST endpoint shown under:
+  #   Confluent Cloud → Cluster → Cluster settings → REST endpoint
+  # Auth uses a Kafka API key (cluster-scoped, NOT a Cloud-level key).
+  # Create under: Confluent Cloud → Cluster → API Keys.
+  #
+  # CONFLUENT_KAFKA_REST_ENDPOINT: "https://lkc-xxxxxx.<region>.aws.confluent.cloud:443"
+  # CONFLUENT_KAFKA_API_KEY:       "KAFKAAPIKEY"
+  # CONFLUENT_KAFKA_API_SECRET:    "kafka-api-secret"
+
+  # ── Schema Registry (optional) ────────────────────────────────────────────────
+  # When configured, every topic Dataset in emitted RunEvents carries a
+  # SchemaDatasetFacet built from the latest key + value subjects. Fields are
+  # prefixed: "key.<field>" and "value.<field>". Supported schema types: AVRO,
+  # JSON Schema, Protobuf (proto stored as opaque field).
+  #
+  # Schema Registry uses its own API key scope — Cloud-level keys do NOT work.
+  # Generate under: Confluent Cloud → Environment → Schema Registry → API Keys.
+  #
+  # schema_registry:
+  #   endpoint:   "https://psrc-xxxxx.<region>.aws.confluent.cloud"
+  #   api_key:    "SRAPIKEY"
+  #   api_secret: "sr-api-secret"
+
   # ── ksqlDB clusters (list, YAML-only) ─────────────────────────────────────────
   # One entry per ksqlDB cluster to scan for persistent query lineage.
   # Create a ksqlDB-scoped API key under: Confluent Cloud → ksqlDB → API Keys.

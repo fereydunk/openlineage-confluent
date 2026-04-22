@@ -1,11 +1,18 @@
 """Confluent Telemetry (Metrics) API client.
 
-Discovers consumer group → topic mappings via the consumer_lag_offsets metric.
-This single metric covers a broad set of components:
-  - Application Kafka consumers (any language/framework)
-  - Kafka Streams applications
-  - Self-managed Connect workers  (connect-<name> groups)
-  - Any other component that commits Kafka consumer group offsets
+Two responsibilities:
+
+1) Discover consumer group → topic mappings via the consumer_lag_offsets
+   metric. This single metric covers a broad set of components:
+     - Application Kafka consumers (any language/framework)
+     - Kafka Streams applications
+     - Self-managed Connect workers  (connect-<name> groups)
+     - Any other component that commits Kafka consumer group offsets
+
+2) Fetch per-topic throughput (bytes + records, in + out) over the lookback
+   window. These are topic-level aggregates — the data is shared across all
+   producers/consumers — and surface as a custom KafkaTopicThroughputDatasetFacet
+   on every dataset in the lineage graph.
 
 Internal Confluent system groups are filtered out — they are already
 represented in the lineage graph by their dedicated sources:
@@ -31,12 +38,24 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from openlineage_confluent.config import ConfluentConfig
-from openlineage_confluent.confluent.models import ConsumerGroupInfo
+from openlineage_confluent.confluent.models import ConsumerGroupInfo, TopicThroughput
 
 log = logging.getLogger(__name__)
 
 _METRICS_BASE = "https://api.telemetry.confluent.cloud"
 _LAG_METRIC   = "io.confluent.kafka.server/consumer_lag_offsets"
+
+# Topic-level throughput metrics. All four are SUM-aggregable cumulative
+# counters when grouped by topic over an interval.
+_RECEIVED_BYTES   = "io.confluent.kafka.server/received_bytes"
+_SENT_BYTES       = "io.confluent.kafka.server/sent_bytes"
+_RECEIVED_RECORDS = "io.confluent.kafka.server/received_records"
+_SENT_RECORDS     = "io.confluent.kafka.server/sent_records"
+
+_THROUGHPUT_METRICS: tuple[str, ...] = (
+    _RECEIVED_BYTES, _SENT_BYTES, _RECEIVED_RECORDS, _SENT_RECORDS,
+)
+
 _PAGE_SIZE    = 1_000   # max rows per Metrics API page
 
 # Consumer group ID prefixes that identify internal Confluent infrastructure.
@@ -102,6 +121,46 @@ class MetricsApiClient:
         return result
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Topic throughput
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_topic_throughput(self) -> dict[str, TopicThroughput]:
+        """Return {topic: TopicThroughput} for all topics with traffic in the window.
+
+        Issues four separate Metrics API queries (one per metric), summing per
+        topic across the interval. Topics with zero traffic for all four metrics
+        are omitted.
+        """
+        agg: dict[str, TopicThroughput] = defaultdict(
+            lambda: TopicThroughput(topic="", window_minutes=self._lookback)
+        )
+        for metric in _THROUGHPUT_METRICS:
+            for row in self._query_topic_metric(metric):
+                topic = row.get("metric.topic")
+                value = row.get("value")
+                if not topic or value is None:
+                    continue
+                bucket = agg[topic]
+                if not bucket.topic:
+                    bucket.topic = topic
+                # The four metric ids are non-overlapping; assign by which one we asked for.
+                if metric == _RECEIVED_BYTES:
+                    bucket.bytes_in    += int(value)
+                elif metric == _SENT_BYTES:
+                    bucket.bytes_out   += int(value)
+                elif metric == _RECEIVED_RECORDS:
+                    bucket.records_in  += int(value)
+                elif metric == _SENT_RECORDS:
+                    bucket.records_out += int(value)
+
+        result = dict(sorted(agg.items()))
+        log.info(
+            "Metrics API: throughput for %d topics (window=%d min)",
+            len(result), self._lookback,
+        )
+        return result
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -118,8 +177,19 @@ class MetricsApiClient:
 
     def _query_lag_metric(self) -> list[dict]:
         """Fetch all rows for consumer_lag_offsets, handling pagination."""
+        return self._query_paginated(
+            metric=_LAG_METRIC,
+            group_by=["metric.consumer_group_id", "metric.topic"],
+        )
+
+    def _query_topic_metric(self, metric: str) -> list[dict]:
+        """Fetch all rows for a single topic-grouped metric."""
+        return self._query_paginated(metric=metric, group_by=["metric.topic"])
+
+    def _query_paginated(self, *, metric: str, group_by: list[str]) -> list[dict]:
+        """Generic paginated POST against /v2/metrics/cloud/query."""
         payload: dict = {
-            "aggregations": [{"metric": _LAG_METRIC, "agg": "SUM"}],
+            "aggregations": [{"metric": metric, "agg": "SUM"}],
             "filter": {
                 "field": "resource.kafka.id",
                 "op":    "EQ",
@@ -127,7 +197,7 @@ class MetricsApiClient:
             },
             "granularity": "PT1M",
             "intervals":   [self._query_interval()],
-            "group_by":    ["metric.consumer_group_id", "metric.topic"],
+            "group_by":    group_by,
             "limit":       _PAGE_SIZE,
         }
 
@@ -142,7 +212,7 @@ class MetricsApiClient:
                 resp = self._http.post("/v2/metrics/cloud/query", json=payload)
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
-                log.warning("Metrics API query failed: %s", exc)
+                log.warning("Metrics API query failed (%s): %s", metric, exc)
                 break
 
             body = resp.json()
@@ -156,7 +226,7 @@ class MetricsApiClient:
             if not page_token:
                 break
 
-        log.debug("Metrics API returned %d consumer_lag_offsets rows", len(rows))
+        log.debug("Metrics API returned %d rows for %s", len(rows), metric)
         return rows
 
     # ──────────────────────────────────────────────────────────────────────────
