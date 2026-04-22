@@ -10,12 +10,14 @@ Flink CLI              ──┤                   │
 Metrics API (consumers)──┼──▶ ol-confluent ──▶─┤ DataHub
 ksqlDB REST API        ──┤                   │
 Self-managed Connect   ──┘                   └─ OpenMetadata / ...
+Schema Registry  ──(enrichment)──┘
+Kafka REST API   ──(enrichment)──┘
              (poll every N seconds)
 ```
 
 ## What it covers
 
-Every poll cycle the bridge fetches from five sources **concurrently**:
+Every poll cycle the bridge fetches from five lineage sources **concurrently**:
 
 | Source | API | Components covered |
 |---|---|---|
@@ -25,16 +27,26 @@ Every poll cycle the bridge fetches from five sources **concurrently**:
 | **ksqlDB REST** | `POST {cluster}/ksql` — `SHOW QUERIES EXTENDED` | ksqlDB persistent queries (CSAS / CTAS) |
 | **Self-managed Connect** | `GET {endpoint}/connectors?expand=info,status` | On-prem or customer-hosted Connect clusters |
 
+Two **optional enrichment sources** add metadata facets to every topic Dataset:
+
+| Source | API | Facet added |
+|---|---|---|
+| **Schema Registry** | `/subjects/{topic}-key|value/versions/latest` | `SchemaDatasetFacet` — field-level schema (AVRO, JSON Schema, Protobuf) |
+| **Kafka REST API** | `/kafka/v3/clusters/{id}/topics` | `KafkaTopicDatasetFacet` — partition count, replication factor, isInternal |
+
+Throughput metrics are also fetched from the Metrics API when consumer lineage is enabled, adding `KafkaTopicThroughputDatasetFacet` (bytes in/out, records in/out) to each topic.
+
 Then each cycle:
 
 1. **Parses Flink SQL** — regex parser extracts `FROM`/`JOIN` inputs and `INSERT INTO`/`CREATE TABLE AS` outputs.
 2. **Resolves ksqlDB stream names to topics** — `SHOW STREAMS/TABLES EXTENDED` maps stream names to their underlying Kafka topics before building edges.
 3. **Filters internal consumer groups** — `_*` and `confluent_cli_consumer_*` groups (ksqlDB internals, Flink internals, CLI consumers) are excluded; application consumer groups remain.
-4. **Builds a lineage graph** — one `(source → job → target)` edge per data-flow relationship.
-5. **Diffs against the previous cycle** — each job's lineage is fingerprinted (SHA-256); unchanged jobs are skipped.
-6. **Detects removals** — jobs absent from the current cycle get a `RunState.ABORT` event so backends mark them inactive.
-7. **Emits RunEvents in parallel** — configurable `ThreadPoolExecutor`, one HTTP connection per thread.
-8. **Persists state across restarts** — SQLite (WAL mode) stores known jobs and fingerprints.
+4. **Enriches topic Datasets** — fetches schemas from Schema Registry and partition metadata from Kafka REST (if configured), attaches them as custom facets to every input/output Dataset.
+5. **Builds a lineage graph** — one `(source → job → target)` edge per data-flow relationship.
+6. **Diffs against the previous cycle** — each job's lineage is fingerprinted (SHA-256); unchanged jobs are skipped.
+7. **Detects removals** — jobs absent from the current cycle get a `RunState.ABORT` event so backends mark them inactive.
+8. **Emits RunEvents in parallel** — configurable `ThreadPoolExecutor`, one HTTP connection per thread.
+9. **Persists state across restarts** — SQLite (WAL mode) stores known jobs and fingerprints.
 
 ## Namespace conventions
 
@@ -48,6 +60,8 @@ Then each cycle:
 
 ## Live demo topology (DEVTEST cluster)
 
+The repository includes a **20-domain demo** provisioning script (see [Scripts](#scripts)). The core orders pipeline:
+
 ```
 [ol-datagen-orders-source]    DatagenSource managed connector
         │
@@ -57,6 +71,9 @@ Then each cycle:
         ├──▶ [ol-enrich-orders]          Flink: flatten + add risk_tier
         │           │
         │     ol-orders-enriched         Kafka topic
+        │     (SchemaDatasetFacet,        ← field-level schema from SR
+        │      KafkaTopicDatasetFacet,    ← partitions / replication from Kafka REST
+        │      KafkaTopicThroughputFacet) ← bytes/records from Metrics API
         │           │
         │    ┌──────┼──────────────────────────────┐
         │    ▼      ▼                               ▼
@@ -174,6 +191,23 @@ List values (`ksql_clusters`, `self_managed_connect_clusters`) are YAML-only.
 | `ksql_clusters` | — | `[]` | List of ksqlDB cluster configs (see below) |
 | `self_managed_connect_clusters` | — | `[]` | List of self-managed Connect cluster configs (see below) |
 
+**Kafka REST API (optional) — adds `KafkaTopicDatasetFacet` to each topic:**
+```yaml
+CONFLUENT_KAFKA_REST_ENDPOINT: "https://lkc-xxxxxx.<region>.aws.confluent.cloud:443"
+CONFLUENT_KAFKA_API_KEY:       "KAFKAAPIKEY"
+CONFLUENT_KAFKA_API_SECRET:    "kafka-api-secret"
+```
+> Use a **cluster-scoped** Kafka API key, not a Cloud-level key. Create it under Confluent Cloud → Cluster → API Keys.
+
+**Schema Registry (optional) — adds `SchemaDatasetFacet` to each topic:**
+```yaml
+schema_registry:
+  endpoint:   "https://psrc-xxxxx.<region>.aws.confluent.cloud"
+  api_key:    "SRAPIKEY"
+  api_secret: "sr-api-secret"
+```
+> Schema Registry uses its own API key scope. Generate it under Confluent Cloud → Environment → Schema Registry → API Keys.
+
 **ksqlDB cluster entry:**
 ```yaml
 ksql_clusters:
@@ -230,7 +264,7 @@ State is persisted in SQLite so removal detection works across process restarts.
 ## Development
 
 ```bash
-make test        # 108 tests, all offline — no credentials required
+make test        # 146 tests, all offline — no credentials required
 make lint        # ruff
 make type-check  # mypy
 ```
@@ -239,6 +273,7 @@ make type-check  # mypy
 
 | File | Purpose |
 |---|---|
+| `provision_20_pipelines.py` | Provisions 19 new demo pipelines (17 with Flink enrich + consumer group, 2 Datagen-only) across business domains — brings total to 20 visible in Marquez. Includes `--teardown` and `--status` modes. Requires `pip install confluent-kafka`. |
 | `producer_consumer_demo.py` | Produces and consumes messages using a named consumer group — use to verify Metrics API consumer lineage detection |
 | `connector-datagen-orders.json` | DatagenSource connector config for DEVTEST topology |
 | `connector-http-sink.json` | HttpSink connector config |
