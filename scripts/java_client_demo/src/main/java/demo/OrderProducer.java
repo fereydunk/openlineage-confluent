@@ -2,7 +2,6 @@ package demo;
 
 import io.openlineage.client.OpenLineage;
 import io.openlineage.client.OpenLineageClient;
-import io.openlineage.client.transports.HttpConfig;
 import io.openlineage.client.transports.HttpTransport;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -20,18 +19,15 @@ import java.util.UUID;
  * events directly to Marquez — the only way to capture Kafka producer identity,
  * since the Confluent Metrics API exposes no client_id dimension for producers.
  *
- * The consumer-side lineage is handled automatically by the bridge via the
- * Metrics API consumer_lag_offsets signal — see OrderConsumer.java.
- *
  * Required env vars (cluster-scoped Kafka API key, not a cloud key):
  *   KAFKA_BOOTSTRAP_SERVERS  e.g. pkc-xxx.us-west-2.aws.confluent.cloud:9092
  *   KAFKA_API_KEY
  *   KAFKA_API_SECRET
  *
  * Optional:
- *   MARQUEZ_URL              default http://localhost:5000
- *   OL_TOPIC                 default ol-raw-orders
- *   MESSAGE_COUNT            default 100
+ *   MARQUEZ_URL     default http://localhost:5000
+ *   OL_TOPIC        default ol-raw-orders
+ *   MESSAGE_COUNT   default 100
  */
 public class OrderProducer {
 
@@ -49,12 +45,10 @@ public class OrderProducer {
         String datasetNamespace = "kafka://" + bootstrap;
 
         // ── OpenLineage client ────────────────────────────────────────────────
-        HttpConfig httpConfig = HttpConfig.builder()
-                .url(URI.create(marquezUrl))
+        HttpTransport transport = HttpTransport.builder()
+                .uri(marquezUrl)
                 .build();
-        OpenLineageClient olClient = OpenLineageClient.builder()
-                .transport(new HttpTransport(httpConfig))
-                .build();
+        OpenLineageClient olClient = new OpenLineageClient(transport);
         OpenLineage ol = new OpenLineage(
                 URI.create("https://github.com/fereydunk/openlineage-confluent"));
 
@@ -113,8 +107,10 @@ public class OrderProducer {
                 .build());
         System.out.println("[OL] COMPLETE emitted");
         System.out.println();
-        System.out.println("Check Marquez UI (http://localhost:3000) — look for job 'order-producer'");
-        System.out.println("in namespace 'java-app://order-service' with output dataset '" + topic + "'.");
+        System.out.println("Check Marquez UI → http://localhost:3000");
+        System.out.println("  namespace : " + JOB_NAMESPACE);
+        System.out.println("  job       : " + JOB_NAME);
+        System.out.println("  output    : " + datasetNamespace + "/" + topic);
     }
 
     private static String requireEnv(String name) {
