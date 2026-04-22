@@ -27,7 +27,7 @@ from openlineage.client.event_v2 import (
     RunEvent,
     RunState,
 )
-from openlineage.client.facet_v2 import documentation_job, ownership_job, schema_dataset
+from openlineage.client.facet_v2 import documentation_job, job_type_job, ownership_job, schema_dataset
 
 from openlineage_confluent.confluent.kafka_rest_client import TopicMetadata
 from openlineage_confluent.confluent.models import LineageEdge, LineageGraph, TopicThroughput
@@ -39,6 +39,27 @@ from openlineage_confluent.mapping.facets import (
 )
 
 log = logging.getLogger(__name__)
+
+
+_JOB_TYPE_MAP: dict[str, tuple[str, str, str]] = {
+    # job_type string → (processingType, integration, jobType)
+    "kafka_connect_source":  ("STREAMING", "KAFKA_CONNECT", "SOURCE_CONNECTOR"),
+    "kafka_connect_sink":    ("STREAMING", "KAFKA_CONNECT", "SINK_CONNECTOR"),
+    "flink_statement":       ("STREAMING", "FLINK",         "QUERY"),
+    "kafka_consumer_group":  ("STREAMING", "KAFKA",         "CONSUMER_GROUP"),
+    "ksqldb_query":          ("STREAMING", "KSQLDB",        "QUERY"),
+}
+
+
+def _job_type_facet(job_type: str) -> job_type_job.JobTypeJobFacet:
+    processing, integration, jt = _JOB_TYPE_MAP.get(
+        job_type, ("STREAMING", "KAFKA", job_type.upper())
+    )
+    return job_type_job.JobTypeJobFacet(
+        processingType=processing,
+        integration=integration,
+        jobType=jt,
+    )
 
 
 def _stable_run_id(namespace: str, name: str, cycle_key: str) -> str:
@@ -107,7 +128,11 @@ class ConfluentOpenLineageMapper:
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
     ) -> RunEvent:
-        job = Job(namespace=ns_hint, name=job_name)
+        job = Job(
+            namespace=ns_hint,
+            name=job_name,
+            facets={"jobType": _job_type_facet(job_type)},
+        )
         run = Run(runId=_stable_run_id(ns_hint, job_name, cycle_key))
 
         inputs:  list[InputDataset]  = []

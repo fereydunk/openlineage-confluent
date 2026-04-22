@@ -59,11 +59,25 @@ public class OrderProducer {
                         .name(topic)
                         .build());
 
+        // JobTypeJobFacet makes the job recognisable in Marquez as a Kafka producer
+        OpenLineage.JobFacets jobFacets = ol.newJobFacetsBuilder()
+                .jobType(ol.newJobTypeJobFacetBuilder()
+                        .processingType("BATCH")
+                        .integration("KAFKA")
+                        .jobType("PRODUCER")
+                        .build())
+                .build();
+        OpenLineage.Job job = ol.newJobBuilder()
+                .namespace(JOB_NAMESPACE)
+                .name(JOB_NAME)
+                .facets(jobFacets)
+                .build();
+
         // Emit START before touching Kafka
         olClient.emit(ol.newRunEventBuilder()
                 .eventTime(ZonedDateTime.now())
                 .eventType(OpenLineage.RunEvent.EventType.START)
-                .job(ol.newJobBuilder().namespace(JOB_NAMESPACE).name(JOB_NAME).build())
+                .job(job)
                 .run(ol.newRunBuilder().runId(runId).build())
                 .outputs(outputs)
                 .build());
@@ -101,7 +115,7 @@ public class OrderProducer {
         olClient.emit(ol.newRunEventBuilder()
                 .eventTime(ZonedDateTime.now())
                 .eventType(OpenLineage.RunEvent.EventType.COMPLETE)
-                .job(ol.newJobBuilder().namespace(JOB_NAMESPACE).name(JOB_NAME).build())
+                .job(job)
                 .run(ol.newRunBuilder().runId(runId).build())
                 .outputs(outputs)
                 .build());
