@@ -275,6 +275,7 @@ make type-check  # mypy
 |---|---|
 | `provision_20_pipelines.py` | Provisions 19 new demo pipelines (17 with Flink enrich + consumer group, 2 Datagen-only) across business domains — brings total to 20 visible in Marquez. Includes `--teardown` and `--status` modes. Requires `pip install confluent-kafka`. |
 | `producer_consumer_demo.py` | Produces and consumes messages using a named consumer group — use to verify Metrics API consumer lineage detection |
+| `java_client_demo/` | Java Maven project showing end-to-end lineage for native Kafka Java clients. `OrderProducer` emits OpenLineage START/COMPLETE events directly to Marquez (the only way to capture producer identity); `OrderConsumer` uses group `ol-java-demo-consumer`, which the bridge detects via the Metrics API automatically. See [Java client demo](#java-client-end-to-end-demo). |
 | `connector-datagen-orders.json` | DatagenSource connector config for DEVTEST topology |
 | `connector-http-sink.json` | HttpSink connector config |
 | `connector-dummy-sink.json` | Minimal DummySink (used for bulk removal detection demo) |
@@ -288,6 +289,59 @@ make type-check  # mypy
 | `diagnose_catalog.py` | Investigation script for the Confluent Stream Catalog Atlas API (determined unusable for operational lineage) |
 | `diagnose_lineage_api.py` | Follow-up investigation of the `/catalog/v1/lineage/` endpoint |
 | `diagnose_real_types.py` | Atlas entity type enumeration script |
+
+## Java client end-to-end demo
+
+This demo shows how native Kafka Java producers and consumers appear in the lineage graph using two different mechanisms.
+
+### Why two mechanisms?
+
+| Side | How lineage is captured | Reason |
+|---|---|---|
+| **Producer** | App emits OpenLineage events directly (`openlineage-java` SDK) | The Confluent Metrics API has no `client_id` dimension for producers — there is no broker-side signal to identify who wrote to a topic |
+| **Consumer** | Bridge detects automatically via Metrics API `consumer_lag_offsets` | Consumer groups are a first-class Kafka concept with a broker-side signal; no app-side changes needed |
+
+### What you'll see in Marquez
+
+```
+[order-producer]          java-app://order-service       (emitted directly by the app)
+       │
+       ▼
+  ol-raw-orders            kafka://<bootstrap>
+       │
+       ├──▶ [ol-enrich-orders]          Flink (bridge-detected)
+       │           │
+       │     ol-orders-enriched
+       │           ...
+       │
+       └──▶ [ol-java-demo-consumer]    kafka-consumer-group://<cluster_id>  (bridge-detected)
+```
+
+### Prerequisites
+
+- JDK 17+, Maven 3.8+
+- Marquez running locally (`make marquez-up`)
+- A **cluster-scoped** Kafka API key (Confluent Cloud → Cluster → API Keys → Kafka cluster scoped)
+
+### Run
+
+```bash
+# Set credentials
+export KAFKA_BOOTSTRAP_SERVERS=pkc-xxx.us-west-2.aws.confluent.cloud:9092
+export KAFKA_API_KEY=YOUR_CLUSTER_KEY
+export KAFKA_API_SECRET=YOUR_CLUSTER_SECRET
+
+# Terminal 1 — produce 100 orders and emit lineage to Marquez
+make java-demo-produce
+
+# Terminal 2 — consume with named group for 90s (bridge detects it)
+make java-demo-consume
+
+# After ~2 min, check the graph
+make validate
+```
+
+Optional overrides (env vars): `MARQUEZ_URL` (default `http://localhost:5000`), `OL_TOPIC` (default `ol-raw-orders`), `MESSAGE_COUNT` (default `100`), `POLL_DURATION_SECS` (default `90`).
 
 ## License
 
