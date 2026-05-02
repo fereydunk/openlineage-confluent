@@ -8,22 +8,40 @@ from openlineage_confluent.confluent.models import (
     ConnectorInfo,
     ConsumerGroupInfo,
     FlinkStatement,
+    KafkaProducerInfo,
     KsqlQuery,
     LineageEdge,
     LineageGraph,
 )
-from openlineage_confluent.config import ConfluentConfig, OpenLineageConfig
+from openlineage_confluent.config import ConfluentConfig, EnvDeployment, OpenLineageConfig
 
 
 # ── Config fixtures ────────────────────────────────────────────────────────────
+
+def _make_env(env_id: str = "env-abc123", cluster_id: str = "lkc-abc123",
+              bootstrap: str = "pkc-abc123.us-east-2.aws.confluent.cloud:9092") -> EnvDeployment:
+    return EnvDeployment(env_id=env_id, cluster_id=cluster_id, kafka_bootstrap=bootstrap)
+
 
 @pytest.fixture()
 def confluent_cfg() -> ConfluentConfig:
     return ConfluentConfig(
         CONFLUENT_CLOUD_API_KEY="test-cloud-key",
         CONFLUENT_CLOUD_API_SECRET="test-cloud-secret",
-        CONFLUENT_ENV_ID="env-abc123",
-        CONFLUENT_CLUSTER_ID="lkc-abc123",
+        environments=[_make_env()],
+    )
+
+
+@pytest.fixture()
+def multi_env_cfg() -> ConfluentConfig:
+    """Config with two environments, used by multi-env tests."""
+    return ConfluentConfig(
+        CONFLUENT_CLOUD_API_KEY="test-cloud-key",
+        CONFLUENT_CLOUD_API_SECRET="test-cloud-secret",
+        environments=[
+            _make_env("env-aaa", "lkc-aaa", "pkc-aaa.us-west-2.aws.confluent.cloud:9092"),
+            _make_env("env-bbb", "lkc-bbb", "pkc-bbb.eu-central-1.aws.confluent.cloud:9092"),
+        ],
     )
 
 
@@ -94,6 +112,16 @@ def sample_flink_statement() -> FlinkStatement:
     )
 
 
+# ── Kafka producer fixture ─────────────────────────────────────────────────────
+
+@pytest.fixture()
+def sample_producer() -> KafkaProducerInfo:
+    return KafkaProducerInfo(
+        client_id="order-service-producer",
+        topics=["ol-raw-orders"],
+    )
+
+
 # ── Consumer group fixture ─────────────────────────────────────────────────────
 
 @pytest.fixture()
@@ -125,6 +153,7 @@ def sample_lineage_graph(
     sample_source_connector,
     sample_sink_connector,
     sample_flink_statement,
+    sample_producer,
     sample_consumer_group,
     sample_ksql_query,
     sample_self_managed_connector,
@@ -200,6 +229,16 @@ def sample_lineage_graph(
             job_type="kafka_connect_source",
             job_namespace_hint="kafka-connect://on-prem-connect",
         ),
+        # Kafka producer: external → ol-raw-orders
+        LineageEdge(
+            source_name="order-service-producer",
+            source_type="external",
+            target_name="ol-raw-orders",
+            target_type="kafka_topic",
+            job_name="order-service-producer",
+            job_type="kafka_producer",
+            job_namespace_hint="kafka-producer://lkc-abc123",
+        ),
     ]
     return LineageGraph(
         edges=edges,
@@ -209,6 +248,7 @@ def sample_lineage_graph(
             sample_self_managed_connector,
         ],
         statements=[sample_flink_statement],
+        producers=[sample_producer],
         consumer_groups=[sample_consumer_group],
         ksql_queries=[sample_ksql_query],
     )

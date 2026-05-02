@@ -1,11 +1,12 @@
 """Data models for all Confluent lineage sources.
 
-Lineage is assembled from five sources:
+Lineage is assembled from six sources:
   1. Connect API (managed)       — connector configs, topic mappings
   2. Flink SQL (CLI)             — statement SQL, parsed for tables
   3. Confluent Metrics API       — consumer_lag_offsets → consumer group → topic
   4. ksqlDB REST API             — persistent queries, stream/table → topic map
   5. Self-managed Connect REST   — connector configs from customer-hosted clusters
+  6. Tableflow CLI               — active topic → Iceberg table mappings
 """
 
 from __future__ import annotations
@@ -104,6 +105,25 @@ class FlinkStatement(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Kafka Producer models  (Confluent Metrics API — received_bytes / client_id)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class KafkaProducerInfo(BaseModel):
+    """A Kafka producer identified by its client_id and the topics it writes to.
+
+    Sourced from the Confluent Metrics API received_bytes metric, grouped by
+    metric.client_id + metric.topic. Covers any Kafka producer that wrote to a
+    topic within the configured lookback window.
+
+    Internal Confluent producer client_ids (connector-producer-*, etc.) are
+    filtered out — those are already represented via the Connect API source.
+    """
+
+    client_id: str
+    topics: list[str] = Field(default_factory=list)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Consumer Group models  (Confluent Metrics API — consumer_lag_offsets)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -122,6 +142,23 @@ class ConsumerGroupInfo(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # ksqlDB models  (ksqlDB REST API — SHOW QUERIES EXTENDED)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tableflow models  (confluent tableflow topic list)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TableflowTopic:
+    """A Confluent Tableflow-enabled topic and its Iceberg table mapping."""
+
+    topic_name: str
+    status: str = "UNKNOWN"
+
+    @property
+    def iceberg_table_name(self) -> str:
+        """Glue table name: hyphens replaced with underscores."""
+        return self.topic_name.replace("-", "_")
+
 
 class KsqlQuery(BaseModel):
     """A ksqlDB persistent query with resolved Kafka topic bindings.
@@ -154,20 +191,25 @@ class LineageEdge(BaseModel):
       flink_statement           — kafka_topic → kafka_topic
       kafka_consumer_group      — kafka_topic → consumer_group
       ksqldb_query              — kafka_topic → kafka_topic
+      tableflow                 — kafka_topic → iceberg_table
 
-    The mapper converts edges to RunEvents. Only kafka_topic typed endpoints
-    become OpenLineage Dataset nodes; external and consumer_group endpoints
-    are silently dropped on the OL side (resulting in inputs-only or
+    The mapper converts edges to RunEvents. Only kafka_topic and iceberg_table
+    typed endpoints become OpenLineage Dataset nodes; external and consumer_group
+    endpoints are silently dropped on the OL side (resulting in inputs-only or
     outputs-only events, which is correct and intentional).
     """
 
     source_name: str          # topic, external system, or consumer group name
-    source_type: str          # "kafka_topic" | "external"
+    source_type: str          # "kafka_topic" | "external" | "iceberg_table"
     target_name: str
-    target_type: str          # "kafka_topic" | "external" | "consumer_group"
+    target_type: str          # "kafka_topic" | "external" | "consumer_group" | "iceberg_table"
     job_name: str             # connector name, statement name, group ID, query ID
     job_type: str             # see docstring above
     job_namespace_hint: str   # used directly as the OL Job namespace
+    target_namespace: str | None = None  # explicit OL namespace for non-Kafka targets
+    # Per-env Kafka bootstrap, used to namespace topic Datasets. None falls
+    # back to OpenLineageConfig.kafka_bootstrap.
+    kafka_bootstrap: str | None = None
 
 
 class LineageGraph(BaseModel):
@@ -181,8 +223,10 @@ class LineageGraph(BaseModel):
     # Constituent source objects (kept for summary and debugging)
     connectors: list[ConnectorInfo] = Field(default_factory=list)      # managed + self-managed
     statements: list[FlinkStatement] = Field(default_factory=list)
+    producers: list[KafkaProducerInfo] = Field(default_factory=list)
     consumer_groups: list[ConsumerGroupInfo] = Field(default_factory=list)
     ksql_queries: list[KsqlQuery] = Field(default_factory=list)
+    tableflow_topics: list[TableflowTopic] = Field(default_factory=list)
 
     # topic name → resolved key/value schemas (empty if SR not configured)
     topic_schemas: dict[str, TopicSchema] = Field(default_factory=dict)
@@ -200,8 +244,10 @@ class LineageGraph(BaseModel):
             "managed_connectors":      managed,
             "self_managed_connectors": self_mgd,
             "flink_statements":        len(self.statements),
+            "kafka_producers":         len(self.producers),
             "consumer_groups":         len(self.consumer_groups),
             "ksql_queries":            len(self.ksql_queries),
+            "tableflow_topics":        len(self.tableflow_topics),
             "edges":                   len(self.edges),
             "topics_with_schema":      len(self.topic_schemas),
             "topics_with_metadata":    len(self.topic_metadata),

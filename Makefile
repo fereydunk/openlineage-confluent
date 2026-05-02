@@ -1,5 +1,7 @@
 .PHONY: install test lint type-check marquez-up marquez-down marquez-logs validate run-once run \
-        java-demo-build java-demo-produce java-demo-consume
+        java-demo-build java-demo-produce java-demo-consume \
+        spark-run \
+        e2e-aws-setup e2e-tableflow-setup e2e-run
 
 JAVA_DEMO_DIR := scripts/java_client_demo
 JAVA_DEMO_JAR := $(JAVA_DEMO_DIR)/target/openlineage-java-demo-1.0-SNAPSHOT.jar
@@ -68,3 +70,43 @@ java-demo-produce: java-demo-build
 # The bridge detects the consumer group automatically via the Metrics API.
 java-demo-consume: java-demo-build
 	java -cp $(JAVA_DEMO_JAR) demo.OrderConsumer
+
+# ─── Spark end-to-end demo ────────────────────────────────────────────────────
+# Reads orders-enriched (Kafka) → decodes Avro → writes Parquet to ~/spark-warehouse/orders_enriched
+# OL Spark listener auto-emits lineage to Marquez — no OL code in the job itself.
+# Requires: export KAFKA_BOOTSTRAP_SERVERS=... KAFKA_API_KEY=... KAFKA_API_SECRET=...
+#           export MARQUEZ_URL=http://localhost:5000  (default)
+
+SPARK_PACKAGES := org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,\
+org.apache.spark:spark-avro_2.12:3.5.5,\
+io.openlineage:openlineage-spark_2.12:1.34.0
+
+# Uses PySpark 3.5.5 from the project venv — system spark-submit (4.x) does not
+# support the OL listener's Kafka source visitor or the QueryExecution.sparkSession() API.
+PYSPARK_SUBMIT := $(shell .venv/bin/python3 -c "import pyspark, os; print(os.path.join(os.path.dirname(pyspark.__file__), 'bin', 'spark-submit'))")
+
+spark-run:
+	JAVA_HOME=/opt/homebrew/opt/openjdk@21 \
+	$(PYSPARK_SUBMIT) \
+	  --packages "$(SPARK_PACKAGES)" \
+	  --exclude-packages "org.slf4j:slf4j-api,org.slf4j:slf4j-reload4j" \
+	  scripts/spark_job/orders_to_warehouse.py
+
+# ─── End-to-end pipeline: Connector → Flink → Tableflow → Iceberg → Spark ────
+# One-time setup (run once after refreshing AWS credentials):
+#   make e2e-aws-setup      (creates S3, Glue DB, IAM role in us-west-2)
+#   make e2e-tableflow-setup (wires Confluent to AWS, enables Tableflow)
+#
+# Daily run (after sourcing ~/aws-session.env):
+#   make e2e-run            (OL bridge run-once + Spark job → lineage in Marquez)
+#
+# Requires: source ~/aws-session.env && export AWS_ACCOUNT_ID=586051073099
+
+e2e-aws-setup:
+	source ~/aws-session.env && python3 scripts/e2e_pipeline/01_aws_setup.py
+
+e2e-tableflow-setup:
+	source ~/aws-session.env && python3 scripts/e2e_pipeline/02_tableflow_setup.py
+
+e2e-run:
+	source ~/aws-session.env && bash scripts/e2e_pipeline/run_e2e.sh

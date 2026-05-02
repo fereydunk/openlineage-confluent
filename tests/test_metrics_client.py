@@ -8,22 +8,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from openlineage_confluent.confluent.metrics_client import MetricsApiClient, _INTERNAL_PREFIXES
-from openlineage_confluent.config import ConfluentConfig
+from openlineage_confluent.config import ConfluentConfig, EnvDeployment
+
+
+def _cfg(**overrides) -> ConfluentConfig:
+    base = dict(
+        CONFLUENT_CLOUD_API_KEY="test-key",
+        CONFLUENT_CLOUD_API_SECRET="test-secret",
+        environments=[EnvDeployment(
+            env_id="env-test", cluster_id="lkc-test",
+            kafka_bootstrap="pkc-test.us-west-2.aws.confluent.cloud:9092",
+        )],
+    )
+    base.update(overrides)
+    return ConfluentConfig(**base)
 
 
 @pytest.fixture()
 def cfg() -> ConfluentConfig:
-    return ConfluentConfig(
-        CONFLUENT_CLOUD_API_KEY="test-key",
-        CONFLUENT_CLOUD_API_SECRET="test-secret",
-        CONFLUENT_ENV_ID="env-test",
-        CONFLUENT_CLUSTER_ID="lkc-test",
-    )
+    return _cfg()
 
 
 @pytest.fixture()
 def client(cfg) -> MetricsApiClient:
-    return MetricsApiClient(cfg)
+    return MetricsApiClient(cfg, "lkc-test")
 
 
 # ── Internal prefix filter ─────────────────────────────────────────────────────
@@ -49,14 +57,8 @@ def test_application_groups_are_not_excluded(client, group_id) -> None:
 
 
 def test_custom_exclude_prefix(cfg) -> None:
-    cfg_with_extra = ConfluentConfig(
-        CONFLUENT_CLOUD_API_KEY="k",
-        CONFLUENT_CLOUD_API_SECRET="s",
-        CONFLUENT_ENV_ID="env-x",
-        CONFLUENT_CLUSTER_ID="lkc-x",
-        consumer_group_exclude_prefixes=["legacy-"],
-    )
-    c = MetricsApiClient(cfg_with_extra)
+    cfg_with_extra = _cfg(consumer_group_exclude_prefixes=["legacy-"])
+    c = MetricsApiClient(cfg_with_extra, "lkc-x")
     assert c._is_internal("legacy-consumer") is True
     assert c._is_internal("new-consumer") is False
 
@@ -76,14 +78,8 @@ def test_query_interval_format(client) -> None:
 
 
 def test_query_interval_custom_lookback(cfg) -> None:
-    cfg_custom = ConfluentConfig(
-        CONFLUENT_CLOUD_API_KEY="k",
-        CONFLUENT_CLOUD_API_SECRET="s",
-        CONFLUENT_ENV_ID="env-x",
-        CONFLUENT_CLUSTER_ID="lkc-x",
-        CONFLUENT_METRICS_LOOKBACK_MINUTES=30,
-    )
-    c = MetricsApiClient(cfg_custom)
+    cfg_custom = _cfg(CONFLUENT_METRICS_LOOKBACK_MINUTES=30)
+    c = MetricsApiClient(cfg_custom, "lkc-x")
     parts = c._query_interval().split("/")
     start = datetime.fromisoformat(parts[0])
     end   = datetime.fromisoformat(parts[1])
@@ -173,7 +169,7 @@ def test_get_consumer_groups_topics_are_sorted(client) -> None:
 
 def test_uses_cloud_key_as_fallback(cfg) -> None:
     """Metrics client falls back to cloud_api_key when no dedicated metrics key is set."""
-    c = MetricsApiClient(cfg)
+    c = MetricsApiClient(cfg, "lkc-test")
     # The httpx auth tuple should use the cloud key
     assert c._http.auth is not None
 
@@ -242,6 +238,65 @@ def test_get_topic_throughput_skips_rows_without_topic(client) -> None:
     with patch.object(client._http, "post", side_effect=responses):
         out = client.get_topic_throughput()
     assert list(out) == ["good"]
+
+
+# ── get_producers ─────────────────────────────────────────────────────────────
+
+def test_get_producers_aggregates_by_client_id(client) -> None:
+    rows = [
+        {"metric.client_id": "order-producer", "metric.topic": "orders",   "value": 100},
+        {"metric.client_id": "order-producer", "metric.topic": "dlq",      "value":  10},
+        {"metric.client_id": "payment-producer", "metric.topic": "payments", "value": 50},
+    ]
+    with patch.object(client._http, "post", return_value=_mock_metrics_response(rows)):
+        producers = client.get_producers()
+
+    assert len(producers) == 2
+    p_map = {p.client_id: p for p in producers}
+    assert set(p_map["order-producer"].topics) == {"orders", "dlq"}
+    assert p_map["payment-producer"].topics == ["payments"]
+
+
+def test_get_producers_filters_connector_internal(client) -> None:
+    rows = [
+        {"metric.client_id": "connector-producer-lcc-abc-0", "metric.topic": "t1", "value": 1},
+        {"metric.client_id": "connector-jdbc-source-0",       "metric.topic": "t2", "value": 1},
+        {"metric.client_id": "my-app-producer",               "metric.topic": "t3", "value": 1},
+    ]
+    with patch.object(client._http, "post", return_value=_mock_metrics_response(rows)):
+        producers = client.get_producers()
+
+    assert len(producers) == 1
+    assert producers[0].client_id == "my-app-producer"
+
+
+def test_get_producers_custom_exclude_prefix(cfg) -> None:
+    cfg_extra = _cfg(producer_client_id_exclude_prefixes=["internal-"])
+    c = MetricsApiClient(cfg_extra, "lkc-x")
+    assert c._is_internal_producer("internal-svc-prod") is True
+    assert c._is_internal_producer("external-svc-prod") is False
+
+
+def test_get_producers_topics_are_sorted(client) -> None:
+    rows = [
+        {"metric.client_id": "prod-a", "metric.topic": "z-topic", "value": 1},
+        {"metric.client_id": "prod-a", "metric.topic": "a-topic", "value": 1},
+    ]
+    with patch.object(client._http, "post", return_value=_mock_metrics_response(rows)):
+        producers = client.get_producers()
+
+    assert producers[0].topics == ["a-topic", "z-topic"]
+
+
+def test_get_producers_handles_http_error(client) -> None:
+    import httpx
+    with patch.object(
+        client._http, "post",
+        side_effect=httpx.HTTPError("connection refused"),
+    ):
+        producers = client.get_producers()
+
+    assert producers == []
 
 
 def test_get_topic_throughput_partial_failure_returns_what_succeeded(client) -> None:

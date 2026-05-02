@@ -186,7 +186,8 @@ def test_lineage_graph_summary(sample_lineage_graph: LineageGraph) -> None:
     assert s["flink_statements"] == 1
     assert s["consumer_groups"] == 1
     assert s["ksql_queries"] == 1
-    assert s["edges"] == 7
+    assert s["edges"] == 8
+    assert s["kafka_producers"] == 1
 
 
 def test_lineage_graph_all_job_types_present(sample_lineage_graph: LineageGraph) -> None:
@@ -195,6 +196,7 @@ def test_lineage_graph_all_job_types_present(sample_lineage_graph: LineageGraph)
         "kafka_connect_source",
         "kafka_connect_sink",
         "flink_statement",
+        "kafka_producer",
         "kafka_consumer_group",
         "ksqldb_query",
     }

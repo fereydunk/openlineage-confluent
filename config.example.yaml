@@ -39,6 +39,12 @@ confluent:
   # consumer_group_exclude_prefixes:
   #   - "legacy-internal-"
   #   - "test-"
+  #
+  # Extra producer client_id prefixes to exclude beyond the built-in filters.
+  # Built-in exclusions: "connector-producer-" and "connector-" (Connect internals).
+  # producer_client_id_exclude_prefixes:
+  #   - "test-producer-"
+  #   - "internal-tools-"
 
   # ── Kafka REST API (optional) ─────────────────────────────────────────────────
   # When configured, every topic Dataset carries a custom KafkaTopicDatasetFacet

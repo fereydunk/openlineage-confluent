@@ -1,14 +1,23 @@
 """Confluent Cloud lineage client — assembles a LineageGraph from all sources.
 
-Sources fetched concurrently via ThreadPoolExecutor:
-  1. Managed Connect API      → connector topic mappings
-  2. Flink SQL (CLI)          → statement SQL parsed for tables
-  3. Confluent Metrics API    → consumer_lag_offsets → consumer group topics
-  4. ksqlDB REST API          → persistent query source/sink topic bindings
-  5. Self-managed Connect     → connector configs from customer-hosted clusters
+Multi-environment topology
+──────────────────────────
+The bridge is configured with a list of EnvDeployment entries (cfg.environments).
+For every env, a per-env sub-client (`_EnvLineageClient`) runs the env-scoped
+fan-out: managed Connect, Flink, Metrics API (producers + consumer groups +
+topic throughput), Tableflow, optional Schema Registry, optional Kafka REST.
+The top-level ConfluentLineageClient runs every env's fan-out concurrently
+and merges the resulting LineageGraphs.
 
-Auth for managed APIs: HTTP Basic with a Cloud-level API key.
-Auth for ksqlDB / self-managed Connect: see KsqlClusterConfig / SelfManagedConnectClusterConfig.
+Globally-configured (NOT env-scoped) sources also folded into the merged graph:
+  - ksqlDB persistent queries     (cfg.ksql_clusters — each carries its own creds)
+  - Self-managed Connect clusters (cfg.self_managed_connect_clusters)
+
+Auth
+────
+Cloud-level API key (api.confluent.cloud) is shared across every per-env
+sub-client via a single httpx.Client. Per-env sub-clients carry their own
+SR/Kafka REST keys when configured.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from openlineage_confluent.config import ConfluentConfig
+from openlineage_confluent.config import ConfluentConfig, EnvDeployment
 from openlineage_confluent.confluent.ksql_client import KsqlDbClient
 from openlineage_confluent.confluent.metrics_client import MetricsApiClient
 from openlineage_confluent.confluent.models import (
@@ -29,9 +38,11 @@ from openlineage_confluent.confluent.models import (
     ConnectorType,
     ConsumerGroupInfo,
     FlinkStatement,
+    KafkaProducerInfo,
     KsqlQuery,
     LineageEdge,
     LineageGraph,
+    TableflowTopic,
     TopicThroughput,
 )
 from openlineage_confluent.confluent.kafka_rest_client import (
@@ -43,6 +54,7 @@ from openlineage_confluent.confluent.schema_registry_client import (
     TopicSchema,
 )
 from openlineage_confluent.confluent.self_managed_connect_client import SelfManagedConnectClient
+from openlineage_confluent.confluent.tableflow_client import TableflowClient
 from openlineage_confluent.confluent.sql_parser import parse_statement
 
 log = logging.getLogger(__name__)
@@ -50,54 +62,39 @@ log = logging.getLogger(__name__)
 _CLOUD_API = "https://api.confluent.cloud"
 
 
-class ConfluentLineageClient:
-    """Builds a LineageGraph from all Confluent data-plane and control-plane sources."""
+class _EnvLineageClient:
+    """Per-environment lineage fan-out: Connect/Flink/Metrics/Tableflow/SR/Kafka REST."""
 
-    def __init__(self, cfg: ConfluentConfig, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        cfg: ConfluentConfig,
+        env: EnvDeployment,
+        http: httpx.Client,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
         self._cfg = cfg
-        auth = (cfg.cloud_api_key, cfg.cloud_api_secret.get_secret_value())
-        self._http = httpx.Client(
-            base_url=_CLOUD_API,
-            auth=auth,
-            timeout=timeout,
-            headers={"Accept": "application/json"},
-        )
+        self._env = env
+        self._http = http       # shared cloud-API httpx client
+        self._metrics = MetricsApiClient(cfg, env.cluster_id, timeout=timeout)
+        self._tableflow = TableflowClient(env.env_id, env.cluster_id)
 
-        # Metrics API client — always created (falls back to cloud key)
-        self._metrics = MetricsApiClient(cfg, timeout=timeout)
-
-        # Per-cluster ksqlDB clients (empty if no clusters configured)
-        self._ksql_clients = [
-            KsqlDbClient(cluster, timeout=timeout)
-            for cluster in cfg.ksql_clusters
-        ]
-
-        # Per-cluster self-managed Connect clients (empty if none configured)
-        self._sm_connect_clients = [
-            SelfManagedConnectClient(cluster, timeout=timeout)
-            for cluster in cfg.self_managed_connect_clusters
-        ]
-
-        # Schema Registry client — optional. When unset, topic Datasets are
-        # emitted without a SchemaDatasetFacet.
         self._sr_client: SchemaRegistryClient | None = None
-        if cfg.schema_registry is not None:
+        if env.schema_registry is not None:
             self._sr_client = SchemaRegistryClient(
-                endpoint=cfg.schema_registry.endpoint,
-                api_key=cfg.schema_registry.api_key,
-                api_secret=cfg.schema_registry.api_secret.get_secret_value(),
+                endpoint=env.schema_registry.endpoint,
+                api_key=env.schema_registry.api_key,
+                api_secret=env.schema_registry.api_secret.get_secret_value(),
                 timeout=timeout,
             )
 
-        # Kafka REST client — optional. When unset, topic Datasets are emitted
-        # without a KafkaTopicDatasetFacet (partition / replication info).
         self._kafka_rest: KafkaRestClient | None = None
-        if cfg.kafka_rest_endpoint and cfg.kafka_api_key and cfg.kafka_api_secret:
+        if env.kafka_rest_endpoint and env.kafka_api_key and env.kafka_api_secret:
             self._kafka_rest = KafkaRestClient(
-                endpoint=cfg.kafka_rest_endpoint,
-                cluster_id=cfg.cluster_id,
-                api_key=cfg.kafka_api_key,
-                api_secret=cfg.kafka_api_secret.get_secret_value(),
+                endpoint=env.kafka_rest_endpoint,
+                cluster_id=env.cluster_id,
+                api_key=env.kafka_api_key,
+                api_secret=env.kafka_api_secret.get_secret_value(),
                 timeout=timeout,
             )
 
@@ -106,15 +103,17 @@ class ConfluentLineageClient:
     # ──────────────────────────────────────────────────────────────────────────
 
     def list_connectors(self) -> list[ConnectorInfo]:
-        """Return all managed connectors for the configured cluster."""
-        env     = self._cfg.environment_id
-        cluster = self._cfg.cluster_id
-
-        resp = self._http.get(
-            f"/connect/v1/environments/{env}/clusters/{cluster}/connectors",
-            params={"expand": "info,status"},
-        )
-        resp.raise_for_status()
+        env     = self._env.env_id
+        cluster = self._env.cluster_id
+        try:
+            resp = self._http.get(
+                f"/connect/v1/environments/{env}/clusters/{cluster}/connectors",
+                params={"expand": "info,status"},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("Connect API fetch failed for env=%s: %s", env, exc)
+            return []
         raw: dict[str, Any] = resp.json()
 
         connectors: list[ConnectorInfo] = []
@@ -133,8 +132,7 @@ class ConfluentLineageClient:
                 config=config,
                 # connect_cluster=None → managed; namespace keyed on env_id
             ))
-            log.debug("Managed connector: %s  type=%s  state=%s", name, c_type, state)
-
+        log.debug("env=%s: %d managed connectors", env, len(connectors))
         return connectors
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -142,12 +140,7 @@ class ConfluentLineageClient:
     # ──────────────────────────────────────────────────────────────────────────
 
     def list_flink_statements(self) -> list[FlinkStatement]:
-        """Return all Flink SQL statements via the Confluent CLI.
-
-        The Flink REST API requires user-level OAuth tokens unavailable via
-        Cloud API keys. The CLI already holds valid credentials and emits JSON.
-        """
-        env = self._cfg.environment_id
+        env = self._env.env_id
         try:
             result = subprocess.run(
                 ["confluent", "flink", "statement", "list",
@@ -155,11 +148,12 @@ class ConfluentLineageClient:
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
-                log.warning("confluent flink statement list failed: %s", result.stderr[:300])
+                log.warning("confluent flink statement list (env=%s) failed: %s",
+                            env, result.stderr[:300])
                 return []
             raw: list[dict[str, Any]] = json.loads(result.stdout)
         except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as exc:
-            log.warning("Failed to list Flink statements: %s", exc)
+            log.warning("Failed to list Flink statements for env=%s: %s", env, exc)
             return []
 
         statements: list[FlinkStatement] = []
@@ -175,82 +169,45 @@ class ConfluentLineageClient:
                     status=status,
                     compute_pool=pool,
                 ))
-                log.debug("Flink statement: %s  status=%s", name, status)
-
+        log.debug("env=%s: %d Flink statements", env, len(statements))
         return statements
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Build lineage graph (all sources, concurrent)
+    # Build per-env lineage graph
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_lineage_graph(self) -> LineageGraph:
-        """Fetch all lineage sources concurrently and build a LineageGraph.
+    def build_graph(self) -> LineageGraph:
+        env       = self._env.env_id
+        cluster   = self._env.cluster_id
+        bootstrap = self._env.kafka_bootstrap
 
-        All I/O-bound fetches run in parallel:
-          - Managed Connect REST  (HTTP)
-          - Flink CLI             (subprocess)
-          - Metrics API           (HTTP)
-          - ksqlDB REST           (HTTP, one per configured cluster)
-          - Self-managed Connect  (HTTP, one per configured cluster)
-        """
-        env     = self._cfg.environment_id
-        cluster = self._cfg.cluster_id
-
-        # Submit all concurrent fetches
-        n_workers = 5 + len(self._ksql_clients) + len(self._sm_connect_clients)
+        n_workers = 6
         futures: dict[str, Any] = {}
 
-        with ThreadPoolExecutor(max_workers=max(n_workers, 4)) as pool:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures["connectors"]       = pool.submit(self.list_connectors)
             futures["statements"]       = pool.submit(self.list_flink_statements)
+            futures["producers"]        = pool.submit(self._metrics.get_producers)
             futures["consumer_groups"]  = pool.submit(self._metrics.get_consumer_groups)
             futures["topic_throughput"] = pool.submit(self._metrics.get_topic_throughput)
+            futures["tableflow"]        = pool.submit(self._tableflow.list_topics)
 
             if self._kafka_rest is not None:
                 futures["topic_metadata"] = pool.submit(
                     self._kafka_rest.get_topic_metadata
                 )
 
-            for kc in self._ksql_clients:
-                futures[f"ksql:{kc._cluster.cluster_id}"] = pool.submit(kc.get_queries)
-
-            for sc in self._sm_connect_clients:
-                futures[f"sm:{sc._name}"] = pool.submit(sc.get_connectors)
-
-        # Collect results (each underlying method already catches exceptions
-        # and returns an empty list on failure, so .result() is safe here)
-        managed_connectors: list[ConnectorInfo]   = futures["connectors"].result()
-        statements: list[FlinkStatement]           = futures["statements"].result()
-        consumer_groups: list[ConsumerGroupInfo]   = futures["consumer_groups"].result()
-
-        ksql_queries: list[KsqlQuery] = []
-        for kc in self._ksql_clients:
-            ksql_queries.extend(futures[f"ksql:{kc._cluster.cluster_id}"].result())
-
-        sm_connectors: list[ConnectorInfo] = []
-        for sc in self._sm_connect_clients:
-            sm_connectors.extend(futures[f"sm:{sc._name}"].result())
-
-        all_connectors = managed_connectors + sm_connectors
-
-        log.info(
-            "Fetched: %d managed connectors, %d self-managed connectors, "
-            "%d Flink statements, %d consumer groups, %d ksqlDB queries",
-            len(managed_connectors), len(sm_connectors),
-            len(statements), len(consumer_groups), len(ksql_queries),
-        )
-
-        # ── Build edges ───────────────────────────────────────────────────────
+        managed_connectors: list[ConnectorInfo] = futures["connectors"].result()
+        statements: list[FlinkStatement]         = futures["statements"].result()
+        producers: list[KafkaProducerInfo]       = futures["producers"].result()
+        consumer_groups: list[ConsumerGroupInfo] = futures["consumer_groups"].result()
+        tableflow_topics: list[TableflowTopic]   = futures["tableflow"].result()
 
         edges: list[LineageEdge] = []
 
-        # ── 1. Connectors (managed + self-managed) ────────────────────────────
-        for conn in all_connectors:
-            ns = (
-                f"kafka-connect://{conn.connect_cluster}"
-                if conn.connect_cluster
-                else f"kafka-connect://{env}"
-            )
+        # ── 1. Managed connectors ────────────────────────────────────────────
+        for conn in managed_connectors:
+            ns = f"kafka-connect://{env}"
             if conn.connector_type == ConnectorType.SOURCE:
                 for topic in conn.topics_produced():
                     edges.append(LineageEdge(
@@ -261,6 +218,7 @@ class ConfluentLineageClient:
                         job_name=conn.name,
                         job_type="kafka_connect_source",
                         job_namespace_hint=ns,
+                        kafka_bootstrap=bootstrap,
                     ))
             else:  # SINK
                 for topic in conn.topics_consumed():
@@ -272,12 +230,12 @@ class ConfluentLineageClient:
                         job_name=conn.name,
                         job_type="kafka_connect_sink",
                         job_namespace_hint=ns,
+                        kafka_bootstrap=bootstrap,
                     ))
 
-        # ── 2. Flink statements ───────────────────────────────────────────────
+        # ── 2. Flink statements ──────────────────────────────────────────────
         for stmt in statements:
             if not stmt.is_running():
-                log.debug("Skipping non-running Flink statement: %s (%s)", stmt.name, stmt.status)
                 continue
             inputs, outputs = parse_statement(stmt.sql)
             if not inputs and not outputs:
@@ -292,9 +250,24 @@ class ConfluentLineageClient:
                         job_name=stmt.name,
                         job_type="flink_statement",
                         job_namespace_hint=f"flink://{env}",
+                        kafka_bootstrap=bootstrap,
                     ))
 
-        # ── 3. Consumer groups (from Metrics API) ─────────────────────────────
+        # ── 3. Kafka producers (Metrics API received_bytes + client_id) ──────
+        for producer in producers:
+            for topic in producer.topics:
+                edges.append(LineageEdge(
+                    source_name=producer.client_id,
+                    source_type="external",
+                    target_name=topic,
+                    target_type="kafka_topic",
+                    job_name=producer.client_id,
+                    job_type="kafka_producer",
+                    job_namespace_hint=f"kafka-producer://{cluster}",
+                    kafka_bootstrap=bootstrap,
+                ))
+
+        # ── 4. Consumer groups (Metrics API) ─────────────────────────────────
         for group in consumer_groups:
             for topic in group.topics:
                 edges.append(LineageEdge(
@@ -305,40 +278,32 @@ class ConfluentLineageClient:
                     job_name=group.group_id,
                     job_type="kafka_consumer_group",
                     job_namespace_hint=f"kafka-consumer-group://{cluster}",
+                    kafka_bootstrap=bootstrap,
                 ))
 
-        # ── 4. ksqlDB persistent queries ──────────────────────────────────────
-        for query in ksql_queries:
-            if not query.is_running():
-                log.debug(
-                    "Skipping non-running ksqlDB query: %s (%s)", query.query_id, query.state
-                )
-                continue
-            if not query.source_topics or not query.sink_topics:
-                log.debug(
-                    "Skipping ksqlDB query with incomplete topic bindings: %s", query.query_id
-                )
-                continue
-            for src in query.source_topics:
-                for sink in query.sink_topics:
-                    edges.append(LineageEdge(
-                        source_name=src,
-                        source_type="kafka_topic",
-                        target_name=sink,
-                        target_type="kafka_topic",
-                        job_name=query.query_id,
-                        job_type="ksqldb_query",
-                        job_namespace_hint=f"ksqldb://{query.ksql_cluster_id}",
-                    ))
+        # ── 5. Tableflow: Kafka topic → Iceberg dataset ──────────────────────
+        glue_region = self._cfg.tableflow_glue_region
+        glue_db     = self._cfg.tableflow_glue_database
+        for tf_topic in tableflow_topics:
+            if glue_region and glue_db:
+                iceberg_ns   = f"glue://{glue_region}"
+                iceberg_name = f"{glue_db}.{tf_topic.iceberg_table_name}"
+            else:
+                iceberg_ns   = "iceberg://tableflow"
+                iceberg_name = tf_topic.iceberg_table_name
+            edges.append(LineageEdge(
+                source_name=tf_topic.topic_name,
+                source_type="kafka_topic",
+                target_name=iceberg_name,
+                target_type="iceberg_table",
+                target_namespace=iceberg_ns,
+                job_name=tf_topic.topic_name,
+                job_type="tableflow",
+                job_namespace_hint=f"tableflow://{env}",
+                kafka_bootstrap=bootstrap,
+            ))
 
-        log.info(
-            "Built lineage graph: %d edges from %d connectors + %d statements + "
-            "%d consumer groups + %d ksqlDB queries",
-            len(edges), len(all_connectors), len(statements),
-            len(consumer_groups), len(ksql_queries),
-        )
-
-        # ── 5. Schema Registry: fetch key+value schema for every topic in graph ─
+        # ── 6. Schema Registry: schemas for every topic in graph ─────────────
         topic_schemas: dict[str, TopicSchema] = {}
         if self._sr_client is not None:
             topics = sorted({
@@ -351,30 +316,204 @@ class ConfluentLineageClient:
             })
             try:
                 topic_schemas = self._sr_client.get_topic_schemas(topics)
-            except Exception as exc:    # noqa: BLE001 — never let SR break the graph
-                log.warning("Schema Registry fetch failed (continuing without schemas): %s", exc)
+            except Exception as exc:    # noqa: BLE001
+                log.warning("Schema Registry fetch failed for env=%s: %s", env, exc)
 
-        # ── 6. Kafka REST: per-topic partition / replication metadata ─────────
+        # ── 7. Kafka REST: per-topic partition / replication metadata ────────
         topic_metadata: dict[str, TopicMetadata] = {}
         if self._kafka_rest is not None:
             try:
                 topic_metadata = futures["topic_metadata"].result()
             except Exception as exc:    # noqa: BLE001
-                log.warning("Kafka REST fetch failed (continuing without metadata): %s", exc)
+                log.warning("Kafka REST fetch failed for env=%s: %s", env, exc)
 
-        # ── 7. Metrics API: per-topic throughput over lookback window ─────────
+        # ── 8. Per-topic throughput ──────────────────────────────────────────
         topic_throughput: dict[str, TopicThroughput] = {}
         try:
             topic_throughput = futures["topic_throughput"].result()
         except Exception as exc:    # noqa: BLE001
-            log.warning("Topic throughput fetch failed (continuing without): %s", exc)
+            log.warning("Topic throughput fetch failed for env=%s: %s", env, exc)
+
+        log.info(
+            "env=%s: %d edges (managed=%d flink=%d producers=%d cg=%d tf=%d)",
+            env, len(edges),
+            len(managed_connectors), len(statements),
+            len(producers), len(consumer_groups), len(tableflow_topics),
+        )
 
         return LineageGraph(
             edges=edges,
-            connectors=all_connectors,
+            connectors=managed_connectors,
             statements=statements,
+            producers=producers,
             consumer_groups=consumer_groups,
+            tableflow_topics=tableflow_topics,
+            topic_schemas=topic_schemas,
+            topic_metadata=topic_metadata,
+            topic_throughput=topic_throughput,
+        )
+
+    def close(self) -> None:
+        self._metrics.close()
+        if self._sr_client is not None:
+            self._sr_client.close()
+        if self._kafka_rest is not None:
+            self._kafka_rest.close()
+
+
+class ConfluentLineageClient:
+    """Top-level lineage client. Fans out across all envs + global ksqlDB / self-managed Connect."""
+
+    def __init__(self, cfg: ConfluentConfig, *, timeout: float = 30.0) -> None:
+        self._cfg = cfg
+        auth = (cfg.cloud_api_key, cfg.cloud_api_secret.get_secret_value())
+        self._http = httpx.Client(
+            base_url=_CLOUD_API,
+            auth=auth,
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+        )
+
+        self._envs: list[_EnvLineageClient] = [
+            _EnvLineageClient(cfg, env, self._http, timeout=timeout)
+            for env in cfg.environments
+        ]
+
+        # ksqlDB clusters and self-managed Connect clusters are configured at
+        # the top level (each entry carries its own creds), not per-env.
+        self._ksql_clients = [
+            KsqlDbClient(cluster, timeout=timeout)
+            for cluster in cfg.ksql_clusters
+        ]
+        self._sm_connect_clients = [
+            SelfManagedConnectClient(cluster, timeout=timeout)
+            for cluster in cfg.self_managed_connect_clusters
+        ]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Build merged lineage graph across all envs + global sources
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_lineage_graph(self) -> LineageGraph:
+        per_env_graphs: list[LineageGraph] = []
+        if self._envs:
+            with ThreadPoolExecutor(max_workers=max(len(self._envs), 1)) as pool:
+                futures = [pool.submit(env.build_graph) for env in self._envs]
+                for fut in futures:
+                    try:
+                        per_env_graphs.append(fut.result())
+                    except Exception as exc:    # noqa: BLE001
+                        log.exception("Per-env graph build failed: %s", exc)
+
+        # ── Global: ksqlDB + self-managed Connect (queried in parallel) ──────
+        ksql_queries: list[KsqlQuery]      = []
+        sm_connectors: list[ConnectorInfo] = []
+        n_global = len(self._ksql_clients) + len(self._sm_connect_clients)
+        if n_global > 0:
+            with ThreadPoolExecutor(max_workers=n_global) as pool:
+                ksql_futs = [pool.submit(c.get_queries)    for c in self._ksql_clients]
+                sm_futs   = [pool.submit(c.get_connectors) for c in self._sm_connect_clients]
+                for fut in ksql_futs:
+                    try:
+                        ksql_queries.extend(fut.result())
+                    except Exception as exc:    # noqa: BLE001
+                        log.warning("ksqlDB fetch failed: %s", exc)
+                for fut in sm_futs:
+                    try:
+                        sm_connectors.extend(fut.result())
+                    except Exception as exc:    # noqa: BLE001
+                        log.warning("Self-managed Connect fetch failed: %s", exc)
+
+        # ── Build edges for global sources ───────────────────────────────────
+        # Self-managed connectors keyed by their cluster label (NOT an env_id)
+        global_edges: list[LineageEdge] = []
+        # Self-managed connectors don't have a per-env Kafka bootstrap (they
+        # may target self-hosted brokers). Leave kafka_bootstrap=None so the
+        # mapper falls back to OpenLineageConfig.kafka_bootstrap.
+        for conn in sm_connectors:
+            ns = f"kafka-connect://{conn.connect_cluster}"
+            if conn.connector_type == ConnectorType.SOURCE:
+                for topic in conn.topics_produced():
+                    global_edges.append(LineageEdge(
+                        source_name=conn.name,
+                        source_type="external",
+                        target_name=topic,
+                        target_type="kafka_topic",
+                        job_name=conn.name,
+                        job_type="kafka_connect_source",
+                        job_namespace_hint=ns,
+                    ))
+            else:
+                for topic in conn.topics_consumed():
+                    global_edges.append(LineageEdge(
+                        source_name=topic,
+                        source_type="kafka_topic",
+                        target_name=conn.name,
+                        target_type="external",
+                        job_name=conn.name,
+                        job_type="kafka_connect_sink",
+                        job_namespace_hint=ns,
+                    ))
+
+        # ksqlDB persistent queries
+        for query in ksql_queries:
+            if not query.is_running():
+                continue
+            if not query.source_topics or not query.sink_topics:
+                continue
+            for src in query.source_topics:
+                for sink in query.sink_topics:
+                    global_edges.append(LineageEdge(
+                        source_name=src,
+                        source_type="kafka_topic",
+                        target_name=sink,
+                        target_type="kafka_topic",
+                        job_name=query.query_id,
+                        job_type="ksqldb_query",
+                        job_namespace_hint=f"ksqldb://{query.ksql_cluster_id}",
+                    ))
+
+        # ── Merge ────────────────────────────────────────────────────────────
+        all_edges:           list[LineageEdge]           = list(global_edges)
+        all_managed_conns:   list[ConnectorInfo]         = []
+        all_statements:      list[FlinkStatement]        = []
+        all_producers:       list[KafkaProducerInfo]     = []
+        all_consumer_groups: list[ConsumerGroupInfo]     = []
+        all_tableflow:       list[TableflowTopic]        = []
+        topic_schemas:       dict[str, TopicSchema]      = {}
+        topic_metadata:      dict[str, TopicMetadata]    = {}
+        topic_throughput:    dict[str, TopicThroughput]  = {}
+
+        for g in per_env_graphs:
+            all_edges.extend(g.edges)
+            all_managed_conns.extend(g.connectors)
+            all_statements.extend(g.statements)
+            all_producers.extend(g.producers)
+            all_consumer_groups.extend(g.consumer_groups)
+            all_tableflow.extend(g.tableflow_topics)
+            topic_schemas.update(g.topic_schemas)
+            topic_metadata.update(g.topic_metadata)
+            topic_throughput.update(g.topic_throughput)
+
+        all_connectors = all_managed_conns + sm_connectors
+
+        log.info(
+            "Merged graph across %d envs: %d edges (managed=%d self-managed=%d "
+            "flink=%d producers=%d cg=%d ksqlDB=%d tableflow=%d)",
+            len(self._envs), len(all_edges),
+            len(all_managed_conns), len(sm_connectors),
+            len(all_statements), len(all_producers),
+            len(all_consumer_groups), len(ksql_queries), len(all_tableflow),
+        )
+
+        return LineageGraph(
+            edges=all_edges,
+            connectors=all_connectors,
+            statements=all_statements,
+            producers=all_producers,
+            consumer_groups=all_consumer_groups,
             ksql_queries=ksql_queries,
+            tableflow_topics=all_tableflow,
             topic_schemas=topic_schemas,
             topic_metadata=topic_metadata,
             topic_throughput=topic_throughput,
@@ -386,15 +525,12 @@ class ConfluentLineageClient:
 
     def close(self) -> None:
         self._http.close()
-        self._metrics.close()
+        for env in self._envs:
+            env.close()
         for c in self._ksql_clients:
             c.close()
         for c in self._sm_connect_clients:
             c.close()
-        if self._sr_client is not None:
-            self._sr_client.close()
-        if self._kafka_rest is not None:
-            self._kafka_rest.close()
 
     def __enter__(self) -> "ConfluentLineageClient":
         return self

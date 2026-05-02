@@ -22,10 +22,10 @@ def mapper(confluent_cfg, ol_cfg) -> ConfluentOpenLineageMapper:
 
 def test_mapper_produces_one_event_per_job(mapper, sample_lineage_graph: LineageGraph) -> None:
     events = mapper.map_all(sample_lineage_graph)
-    # 7 distinct jobs: managed source, flink, managed sink, consumer group,
-    # ksqlDB query, self-managed source  → but consumer group has 2 edges (same job key)
-    # so unique jobs = 6
-    assert len(events) == 6
+    # 8 distinct jobs: managed source, flink, managed sink, kafka producer,
+    # consumer group, ksqlDB query, self-managed source
+    # Consumer group has 2 edges (same job key) → unique jobs = 7
+    assert len(events) == 7
 
 
 def test_all_events_are_complete(mapper, sample_lineage_graph: LineageGraph) -> None:
@@ -79,6 +79,33 @@ def test_flink_job_inputs_and_outputs(mapper, sample_lineage_graph: LineageGraph
     event = events["ol-enrich-orders"]
     assert [d.name for d in (event.inputs or [])] == ["ol-raw-orders"]
     assert [d.name for d in (event.outputs or [])] == ["ol-orders-enriched"]
+
+
+# ── Kafka producers ───────────────────────────────────────────────────────────
+
+def test_producer_namespace(mapper, sample_lineage_graph: LineageGraph) -> None:
+    events = {e.job.name: e for e in mapper.map_all(sample_lineage_graph)}
+    event = events["order-service-producer"]
+    assert event.job.namespace == "kafka-producer://lkc-abc123"
+
+
+def test_producer_job_type_facet(mapper, sample_lineage_graph: LineageGraph) -> None:
+    events = {e.job.name: e for e in mapper.map_all(sample_lineage_graph)}
+    event = events["order-service-producer"]
+    jt = event.job.facets["jobType"]
+    assert jt.processingType == "STREAMING"
+    assert jt.integration == "KAFKA"
+    assert jt.jobType == "PRODUCER"
+
+
+def test_producer_has_output_topic_and_no_inputs(
+    mapper, sample_lineage_graph: LineageGraph
+) -> None:
+    events = {e.job.name: e for e in mapper.map_all(sample_lineage_graph)}
+    event = events["order-service-producer"]
+    assert not event.inputs
+    assert event.outputs
+    assert event.outputs[0].name == "ol-raw-orders"
 
 
 # ── Consumer groups ────────────────────────────────────────────────────────────

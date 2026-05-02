@@ -5,10 +5,12 @@ Each event carries all input datasets and all output datasets for that job.
 
 Namespace conventions
 ─────────────────────
-kafka_topic   → Dataset   namespace=kafka://<bootstrap>      name=<topic>
-source conn.  → Job       namespace=kafka-connect://<env>    name=<connector>
-sink conn.    → Job       namespace=kafka-connect://<env>    name=<connector>
-flink stmt.   → Job       namespace=flink://<env>            name=<statement>
+kafka_topic    → Dataset   namespace=kafka://<bootstrap>      name=<topic>
+iceberg_table  → Dataset   namespace=glue://<region>          name=<db>.<table>
+source conn.   → Job       namespace=kafka-connect://<env>    name=<connector>
+sink conn.     → Job       namespace=kafka-connect://<env>    name=<connector>
+flink stmt.    → Job       namespace=flink://<env>            name=<statement>
+tableflow      → Job       namespace=tableflow://<env>        name=<topic>
 """
 
 from __future__ import annotations
@@ -46,8 +48,10 @@ _JOB_TYPE_MAP: dict[str, tuple[str, str, str]] = {
     "kafka_connect_source":  ("STREAMING", "KAFKA_CONNECT", "SOURCE_CONNECTOR"),
     "kafka_connect_sink":    ("STREAMING", "KAFKA_CONNECT", "SINK_CONNECTOR"),
     "flink_statement":       ("STREAMING", "FLINK",         "QUERY"),
+    "kafka_producer":        ("STREAMING", "KAFKA",         "PRODUCER"),
     "kafka_consumer_group":  ("STREAMING", "KAFKA",         "CONSUMER_GROUP"),
     "ksqldb_query":          ("STREAMING", "KSQLDB",        "QUERY"),
+    "tableflow":             ("BATCH",     "TABLEFLOW",     "TABLE_SYNC"),
 }
 
 
@@ -141,22 +145,47 @@ class ConfluentOpenLineageMapper:
         seen_inputs:  set[str] = set()
         seen_outputs: set[str] = set()
 
+        # All edges in this group share the same job, so they share the same
+        # per-env Kafka bootstrap. Pick the first non-empty value, fall back
+        # to the OL config default.
+        bootstrap = next(
+            (e.kafka_bootstrap for e in edges if e.kafka_bootstrap),
+            self._ol.kafka_bootstrap,
+        )
+
         for edge in edges:
             # Source side
             src_key = f"{edge.source_type}:{edge.source_name}"
-            if src_key not in seen_inputs and edge.source_type == "kafka_topic":
-                inputs.append(self._make_input(
-                    edge.source_name, topic_schemas, topic_metadata, topic_throughput,
-                ))
-                seen_inputs.add(src_key)
+            if src_key not in seen_inputs:
+                if edge.source_type == "kafka_topic":
+                    inputs.append(self._make_input(
+                        edge.source_name, bootstrap,
+                        topic_schemas, topic_metadata, topic_throughput,
+                    ))
+                    seen_inputs.add(src_key)
+                elif edge.source_type == "iceberg_table":
+                    inputs.append(InputDataset(
+                        namespace=edge.job_namespace_hint,
+                        name=edge.source_name,
+                    ))
+                    seen_inputs.add(src_key)
 
             # Target side
             tgt_key = f"{edge.target_type}:{edge.target_name}"
-            if tgt_key not in seen_outputs and edge.target_type == "kafka_topic":
-                outputs.append(self._make_output(
-                    edge.target_name, topic_schemas, topic_metadata, topic_throughput,
-                ))
-                seen_outputs.add(tgt_key)
+            if tgt_key not in seen_outputs:
+                if edge.target_type == "kafka_topic":
+                    outputs.append(self._make_output(
+                        edge.target_name, bootstrap,
+                        topic_schemas, topic_metadata, topic_throughput,
+                    ))
+                    seen_outputs.add(tgt_key)
+                elif edge.target_type == "iceberg_table":
+                    iceberg_ns = edge.target_namespace or "iceberg://tableflow"
+                    outputs.append(OutputDataset(
+                        namespace=iceberg_ns,
+                        name=edge.target_name,
+                    ))
+                    seen_outputs.add(tgt_key)
 
         return RunEvent(
             eventType=RunState.COMPLETE,
@@ -172,18 +201,16 @@ class ConfluentOpenLineageMapper:
     # Dataset helpers
     # ------------------------------------------------------------------
 
-    def _kafka_namespace(self) -> str:
-        return f"kafka://{self._ol.kafka_bootstrap}"
-
     def _make_input(
         self,
         topic: str,
+        bootstrap: str,
         topic_schemas: dict[str, TopicSchema],
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
     ) -> InputDataset:
         return InputDataset(
-            namespace=self._kafka_namespace(),
+            namespace=f"kafka://{bootstrap}",
             name=topic,
             facets=self._dataset_facets(topic, topic_schemas, topic_metadata, topic_throughput),
         )
@@ -191,12 +218,13 @@ class ConfluentOpenLineageMapper:
     def _make_output(
         self,
         topic: str,
+        bootstrap: str,
         topic_schemas: dict[str, TopicSchema],
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
     ) -> OutputDataset:
         return OutputDataset(
-            namespace=self._kafka_namespace(),
+            namespace=f"kafka://{bootstrap}",
             name=topic,
             facets=self._dataset_facets(topic, topic_schemas, topic_metadata, topic_throughput),
         )

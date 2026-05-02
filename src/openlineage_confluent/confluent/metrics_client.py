@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from openlineage_confluent.config import ConfluentConfig
-from openlineage_confluent.confluent.models import ConsumerGroupInfo, TopicThroughput
+from openlineage_confluent.confluent.models import ConsumerGroupInfo, KafkaProducerInfo, TopicThroughput
 
 log = logging.getLogger(__name__)
 
@@ -61,16 +61,35 @@ _PAGE_SIZE    = 1_000   # max rows per Metrics API page
 # Consumer group ID prefixes that identify internal Confluent infrastructure.
 # These groups are covered by dedicated lineage sources (Flink CLI, Connect API,
 # ksqlDB REST) and must not appear as plain "consumer group" jobs.
-_INTERNAL_PREFIXES: tuple[str, ...] = (
+_INTERNAL_CONSUMER_PREFIXES: tuple[str, ...] = (
     "_",                        # _confluent-*, _ksql-*, _schemas, Flink internals
     "confluent_cli_consumer_",  # ad-hoc Confluent CLI consumers
+)
+
+# Keep backward-compatible alias used in _is_internal()
+_INTERNAL_PREFIXES = _INTERNAL_CONSUMER_PREFIXES
+
+# Producer client_id prefixes for Confluent-internal producers.
+# Connector source connectors use "connector-producer-<task_group_id>-<task>"
+# for managed connectors and "connector-<name>-<task>" for self-managed.
+# These are already represented by the Connect API source, so we exclude them.
+_INTERNAL_PRODUCER_PREFIXES: tuple[str, ...] = (
+    "connector-producer-",   # managed Kafka Connect source internal producer
+    "connector-",            # self-managed Kafka Connect source internal producer
+    "_confluent-flink_",     # Confluent Cloud Flink internal producer (already in Flink statement lineage)
 )
 
 
 class MetricsApiClient:
     """Queries consumer_lag_offsets to discover consumer group → topic bindings."""
 
-    def __init__(self, cfg: ConfluentConfig, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        cfg: ConfluentConfig,
+        cluster_id: str,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
         # Fall back to the cloud API key if a dedicated metrics key is not set.
         key = cfg.metrics_api_key or cfg.cloud_api_key
         secret = (cfg.metrics_api_secret or cfg.cloud_api_secret).get_secret_value()
@@ -84,9 +103,10 @@ class MetricsApiClient:
                 "Accept":       "application/json",
             },
         )
-        self._cluster_id = cfg.cluster_id
-        self._lookback   = cfg.metrics_lookback_minutes
-        self._extra      = tuple(cfg.consumer_group_exclude_prefixes)
+        self._cluster_id       = cluster_id
+        self._lookback         = cfg.metrics_lookback_minutes
+        self._extra            = tuple(cfg.consumer_group_exclude_prefixes)
+        self._extra_producer   = tuple(cfg.producer_client_id_exclude_prefixes)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -116,6 +136,43 @@ class MetricsApiClient:
         ]
         log.info(
             "Metrics API: %d consumer groups found (lookback=%d min)",
+            len(result), self._lookback,
+        )
+        return result
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Kafka producers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_producers(self) -> list[KafkaProducerInfo]:
+        """Return all non-internal Kafka producers active in the lookback window.
+
+        Queries received_bytes grouped by (topic, client_id). Any producer
+        client_id whose prefix matches the built-in or user-configured exclusion
+        list is omitted — those are already captured by the Connect API source.
+
+        Built-in exclusions:
+          connector-producer-*  — managed Connect source internal producer
+          connector-*           — self-managed Connect source internal producer
+        """
+        rows = self._query_paginated(
+            metric=_RECEIVED_BYTES,
+            group_by=["metric.topic", "metric.client_id"],
+        )
+
+        clients: dict[str, set[str]] = defaultdict(set)
+        for row in rows:
+            client_id = row.get("metric.client_id", "")
+            topic     = row.get("metric.topic", "")
+            if client_id and topic and not self._is_internal_producer(client_id):
+                clients[client_id].add(topic)
+
+        result = [
+            KafkaProducerInfo(client_id=cid, topics=sorted(topics))
+            for cid, topics in sorted(clients.items())
+        ]
+        log.info(
+            "Metrics API: %d producers found (lookback=%d min)",
             len(result), self._lookback,
         )
         return result
@@ -165,9 +222,14 @@ class MetricsApiClient:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _is_internal(self, group_id: str) -> bool:
-        """Return True if this group ID should be excluded from lineage."""
+        """Return True if this consumer group ID should be excluded from lineage."""
         all_prefixes = _INTERNAL_PREFIXES + self._extra
         return any(group_id.startswith(p) for p in all_prefixes)
+
+    def _is_internal_producer(self, client_id: str) -> bool:
+        """Return True if this producer client_id should be excluded from lineage."""
+        all_prefixes = _INTERNAL_PRODUCER_PREFIXES + self._extra_producer
+        return any(client_id.startswith(p) for p in all_prefixes)
 
     def _query_interval(self) -> str:
         """ISO 8601 interval covering the last N minutes, aligned to minutes."""

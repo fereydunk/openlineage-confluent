@@ -410,6 +410,7 @@ class StressTestOrchestrator:
         n_mutations:        int,
         max_workers:        int,
         state_dir:          Path,
+        env_name:           str | None = None,
     ) -> None:
         self._duration_s         = duration_s
         self._poll_interval_s    = poll_interval_s
@@ -425,9 +426,17 @@ class StressTestOrchestrator:
 
         self._verifier = MarquezVerifier(marquez_url)
 
+        # Env naming:
+        # - env_name unset (default)         → env-sim-001, env-sim-002, ...
+        # - env_name set + n_envs == 1       → exactly env_name (no suffix)
+        # - env_name set + n_envs >  1       → <env_name>-001, <env_name>-002, ...
+        prefix = env_name or "env-sim"
         self._envs: list[tuple[str, SimulatedGraph, EnvironmentRunner]] = []
         for i in range(n_envs):
-            env_id = f"env-sim-{i+1:03d}"
+            if env_name and n_envs == 1:
+                env_id = env_name
+            else:
+                env_id = f"{prefix}-{i+1:03d}"
             graph  = SimulatedGraph(env_id, n_pipelines, n_components)
             runner = EnvironmentRunner(env_id, graph, ol_cfg, state_dir, max_workers)
             self._envs.append((env_id, graph, runner))
@@ -764,6 +773,10 @@ def main() -> None:
                    help="Seconds between mutations  [default: 300 = 5 min]")
     p.add_argument("--envs",               type=int, default=3,
                    help="Simulated environments  [default: 3]")
+    p.add_argument("--env-name",           type=str, default=None,
+                   help="Override env_id prefix. With --envs=1 the value is "
+                        "used verbatim; with --envs>1 it gets a -NNN suffix. "
+                        "Default: env-sim")
     p.add_argument("--pipelines",          type=int, default=100,
                    help="Pipelines per environment  [default: 100]")
     p.add_argument("--components",         type=int, default=20,
@@ -802,6 +815,7 @@ def main() -> None:
         n_mutations=args.mutations,
         max_workers=args.workers,
         state_dir=args.state_dir,
+        env_name=args.env_name,
     )
     orchestrator.run()
 

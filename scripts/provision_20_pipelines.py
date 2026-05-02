@@ -9,9 +9,13 @@ Topology per new domain (17 with Flink, 2 Datagen-only):
 Existing orders domain (3 Flink statements + 2 connectors) stays untouched.
 
 Usage:
-    python scripts/provision_20_pipelines.py --provision
-    python scripts/provision_20_pipelines.py --teardown
-    python scripts/provision_20_pipelines.py --status
+    python scripts/provision_20_pipelines.py --env <env_id> --provision
+    python scripts/provision_20_pipelines.py --env <env_id> --teardown
+    python scripts/provision_20_pipelines.py --env <env_id> --status
+
+All Confluent Cloud creds (cluster_id, Kafka API key, Schema Registry endpoint
++ key, Flink compute pool) are read from config.yaml's `environments:` list
+under the matching env_id. Populate config.yaml via the setup wizard first.
 
 Requirements:
     pip install confluent-kafka   (for consumer groups)
@@ -30,21 +34,76 @@ from pathlib import Path
 
 import httpx
 
-# ─── Confluent Cloud config ───────────────────────────────────────────────────
-ENV_ID          = "env-m2qxq"
-CLUSTER_ID      = "lkc-1j6rd3"
-FLINK_POOL      = "lfcp-dw3qy7"
-SR_ENDPOINT     = "https://psrc-lq3wm.eu-central-1.aws.confluent.cloud"
-SR_KEY          = "BPYPBFCQOV6A63XQ"
-SR_SECRET       = "cfltcF9Ox9GB8RvYQ2xqEVhbXDs7hY14nMN+XcGxkOs3/nfOA/U5EyLzavrTOxmg"
-KAFKA_BOOTSTRAP = "pkc-pgq85.us-west-2.aws.confluent.cloud:9092"
-KAFKA_API_KEY   = "JBFEOVMJA543R4MK"
-KAFKA_API_SECRET = "cfltdxo/BFz4gGEouBEt+f6LCg+n8gQZ3s5K7vPF0eCJHRm/nWzU2kgXdrhid7Sw"
-
+# Make the project package importable when running this script directly.
 SCRIPT_DIR = Path(__file__).parent
-STATE_FILE = SCRIPT_DIR / "demo_20_state.json"
-PIDS_FILE  = SCRIPT_DIR / "demo_20_consumers.pids"
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from openlineage_confluent.config import AppConfig  # noqa: E402
+
+# ─── Per-env config (populated in main() from config.yaml) ───────────────────
+ENV_ID:          str = ""
+CLUSTER_ID:      str = ""
+FLINK_POOL:      str = ""
+SR_ENDPOINT:     str = ""
+SR_KEY:          str = ""
+SR_SECRET:       str = ""
+KAFKA_BOOTSTRAP: str = ""
+KAFKA_API_KEY:   str = ""
+KAFKA_API_SECRET: str = ""
+
+# Per-env state file paths (set in main() so multi-env doesn't clobber)
+STATE_FILE: Path = SCRIPT_DIR / "demo_20_state.json"
+PIDS_FILE:  Path = SCRIPT_DIR / "demo_20_consumers.pids"
 WORKER_SCRIPT = SCRIPT_DIR / "demo_20_consumer_worker.py"
+
+
+def _load_env_creds(config_path: Path, env_id: str) -> None:
+    """Populate the module-level config constants from config.yaml.
+
+    Sets STATE_FILE / PIDS_FILE per env so multiple envs can be provisioned
+    without their state files clobbering each other.
+    """
+    global ENV_ID, CLUSTER_ID, FLINK_POOL
+    global SR_ENDPOINT, SR_KEY, SR_SECRET
+    global KAFKA_BOOTSTRAP, KAFKA_API_KEY, KAFKA_API_SECRET
+    global STATE_FILE, PIDS_FILE
+
+    cfg = AppConfig.from_yaml(config_path)
+    env = next((e for e in cfg.confluent.environments if e.env_id == env_id), None)
+    if env is None:
+        sys.exit(
+            f"ERROR: env_id '{env_id}' not found in {config_path}. "
+            f"Available: {[e.env_id for e in cfg.confluent.environments]}"
+        )
+
+    ENV_ID          = env.env_id
+    CLUSTER_ID      = env.cluster_id
+    FLINK_POOL      = env.flink_compute_pool or ""
+    KAFKA_BOOTSTRAP = env.kafka_bootstrap
+    KAFKA_API_KEY   = env.kafka_api_key or ""
+    KAFKA_API_SECRET = (
+        env.kafka_api_secret.get_secret_value() if env.kafka_api_secret else ""
+    )
+
+    if env.schema_registry is not None:
+        SR_ENDPOINT = env.schema_registry.endpoint
+        SR_KEY      = env.schema_registry.api_key
+        SR_SECRET   = env.schema_registry.api_secret.get_secret_value()
+
+    if not (CLUSTER_ID and KAFKA_API_KEY and KAFKA_API_SECRET):
+        sys.exit(
+            f"ERROR: env '{env_id}' is missing cluster_id or Kafka API key/secret in config.yaml. "
+            f"Re-run the setup wizard to populate per-env credentials."
+        )
+    if not FLINK_POOL:
+        print(
+            f"WARNING: env '{env_id}' has no flink_compute_pool set; "
+            f"Flink statements cannot be created. Set EnvDeployment.flink_compute_pool."
+        )
+
+    STATE_FILE = SCRIPT_DIR / f"demo_20_state_{env_id}.json"
+    PIDS_FILE  = SCRIPT_DIR / f"demo_20_consumers_{env_id}.pids"
 
 # ─── Domains ─────────────────────────────────────────────────────────────────
 # 17 new domains with 1 Flink statement each = 17 CFU → total 20 with existing 3
@@ -403,11 +462,17 @@ def status() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--env", required=True,
+                        help="Confluent Cloud env_id from config.yaml's environments: list")
+    parser.add_argument("--config", default=str(PROJECT_ROOT / "config.yaml"),
+                        help="Path to config.yaml (default: project root config.yaml)")
     grp = parser.add_mutually_exclusive_group(required=True)
     grp.add_argument("--provision", action="store_true", help="Create all 19 new pipelines")
     grp.add_argument("--teardown",  action="store_true", help="Delete everything created by --provision")
     grp.add_argument("--status",    action="store_true", help="Show provisioning state")
     args = parser.parse_args()
+
+    _load_env_creds(Path(args.config), args.env)
 
     if args.provision:
         provision()

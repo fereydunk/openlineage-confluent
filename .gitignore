@@ -41,3 +41,12 @@ config.yaml
 
 # Temporary diagnostic scripts output
 *.log
+
+# Maven build artifacts (Java demo)
+scripts/java_client_demo/target/
+scripts/java_client_demo/dependency-reduced-pom.xml
+
+# Wizard local state (per-env demo provisioning bookkeeping)
+scripts/demo_20_state*.json
+scripts/demo_20_consumers*.pids
+scripts/demo_20_consumer_worker.py
