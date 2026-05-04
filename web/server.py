@@ -38,7 +38,6 @@ PORT       = 8892
 REPO_DIR   = Path(__file__).resolve().parent.parent
 CONFIG_YML = REPO_DIR / "config.yaml"
 EXAMPLE_YML = REPO_DIR / "config.example.yaml"
-STRESS_TEST = REPO_DIR / "scripts" / "stress_test.py"
 
 # Patched Marquez UI lives in a sibling repo. The upstream marquezproject/marquez-web
 # image (port 3000 in docker-compose.yml) renders generic job labels and is missing
@@ -66,10 +65,13 @@ _lt_state: dict = {
 }
 
 # ── Bridge process state (separate from load-test; both can run concurrently)
+# Phases: idle → provisioning → running → done. The proc handle is None during
+# provisioning; the launcher thread sets it once `ol-confluent run` is spawned.
 _BRIDGE_RING_SIZE = 2_000
 _bridge_lock = threading.Lock()
 _bridge_state: dict = {
     "proc":       None,
+    "phase":      "idle",        # idle | provisioning | running | done
     "args":       [],
     "lines":      deque(maxlen=_BRIDGE_RING_SIZE),
     "done":       False,
@@ -364,11 +366,70 @@ def _upsert_environment(env_entry: dict) -> None:
     )
 
 
-def _configured_env_ids() -> list[dict]:
-    """Return [{env_id, has_kafka_creds, has_sr, flink_pool}, ...] from config.yaml.
+def _read_selected_envs() -> list[dict]:
+    """Return the wizard's pending selection: [{env_id, env_name}, ...].
 
-    Applies the same legacy-single-env shim used by AppConfig.from_yaml so an
-    older config.yaml (top-level CONFLUENT_ENV_ID etc) still appears here.
+    Lives at confluent.selected_envs in config.yaml. Pydantic ignores unknown
+    fields, so the bridge runtime never sees this list — it is wizard-private
+    state for envs the user has picked but that have not yet been provisioned
+    (cluster + Kafka/SR API keys minted) on a Start OpenLineage run.
+    """
+    if not CONFIG_YML.exists():
+        return []
+    import yaml
+    try:
+        raw = yaml.safe_load(CONFIG_YML.read_text()) or {}
+    except yaml.YAMLError:
+        return []
+    out: list[dict] = []
+    for e in (raw.get("confluent") or {}).get("selected_envs") or []:
+        if isinstance(e, dict) and e.get("env_id"):
+            out.append({
+                "env_id":   e.get("env_id", ""),
+                "env_name": e.get("env_name", ""),
+            })
+    return out
+
+
+def _write_selected_envs(envs: list[dict]) -> None:
+    """Replace confluent.selected_envs in config.yaml.
+
+    Each entry should have env_id and (optionally) env_name. Empty list removes
+    the field entirely. Preserves the rest of the YAML document via round-trip.
+    """
+    import yaml
+
+    if not CONFIG_YML.exists():
+        if EXAMPLE_YML.exists():
+            CONFIG_YML.write_text(EXAMPLE_YML.read_text())
+        else:
+            CONFIG_YML.write_text("confluent: {}\n")
+
+    raw = yaml.safe_load(CONFIG_YML.read_text()) or {}
+    confluent = raw.setdefault("confluent", {})
+
+    cleaned = [
+        {"env_id": e["env_id"], "env_name": e.get("env_name", "")}
+        for e in envs if e.get("env_id")
+    ]
+    if cleaned:
+        confluent["selected_envs"] = cleaned
+    else:
+        confluent.pop("selected_envs", None)
+
+    CONFIG_YML.write_text(
+        yaml.safe_dump(raw, sort_keys=False, default_flow_style=False, width=200)
+    )
+
+
+def _configured_env_ids() -> list[dict]:
+    """Return [{env_id, has_kafka_creds, has_sr, flink_pool, pending}, ...].
+
+    Unions confluent.selected_envs (pending — not yet provisioned) with
+    confluent.environments (fully provisioned). Pre-checks both lists when the
+    wizard reloads, so users see their previous selection regardless of whether
+    the bridge has been started yet. Applies the same legacy-single-env shim
+    used by AppConfig.from_yaml so an older config.yaml still appears here.
     """
     if not CONFIG_YML.exists():
         return []
@@ -386,17 +447,33 @@ def _configured_env_ids() -> list[dict]:
     except Exception:    # noqa: BLE001
         pass
 
-    envs = (raw.get("confluent") or {}).get("environments") or []
-    out = []
-    for e in envs:
-        if not isinstance(e, dict):
+    confluent = raw.get("confluent") or {}
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for e in confluent.get("environments") or []:
+        if not isinstance(e, dict) or not e.get("env_id"):
             continue
+        seen.add(e["env_id"])
         out.append({
             "env_id":           e.get("env_id", ""),
             "has_kafka_creds":  bool(e.get("kafka_api_key")),
             "has_sr":           bool(e.get("schema_registry")),
             "flink_pool":       e.get("flink_compute_pool", ""),
+            "pending":          False,
         })
+
+    for e in confluent.get("selected_envs") or []:
+        if not isinstance(e, dict) or not e.get("env_id") or e["env_id"] in seen:
+            continue
+        out.append({
+            "env_id":           e.get("env_id", ""),
+            "has_kafka_creds":  False,
+            "has_sr":           False,
+            "flink_pool":       "",
+            "pending":          True,
+        })
+
     return out
 
 
@@ -542,19 +619,25 @@ def _marquez_action(action: str) -> tuple[int, str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Load test (scripts/provision_20_pipelines.py) — single concurrent run
+# Load test (scripts/provision_demo_pipelines.py) — single concurrent run
 #
 # Provisions REAL Confluent Cloud resources (Datagen connectors + Flink
 # statements + consumer groups) in the chosen env. The bridge picks them up
 # via the normal CC APIs and lineage flows to Marquez indirectly.
 #
-# Before launching provision_20_pipelines.py, the worker thread ensures the
-# env has the prerequisites (Kafka cluster, SR, Flink compute pool) and
-# creates them if missing — all streaming live into the load-test ring buffer
-# so the browser sees every step.
+# Before launching the script, the worker thread ensures the env has the
+# prerequisites (Kafka cluster, SR, Flink compute pool) and creates them if
+# missing — all streaming live into the load-test ring buffer so the browser
+# sees every step.
 # ──────────────────────────────────────────────────────────────────────────────
 
-PROVISION_SCRIPT = REPO_DIR / "scripts" / "provision_20_pipelines.py"
+PROVISION_SCRIPT = REPO_DIR / "scripts" / "provision_demo_pipelines.py"
+
+# Wizard input bounds — clamped server-side regardless of what the browser sends.
+_LT_MIN_PIPELINES = 1
+_LT_MAX_PIPELINES = 50
+_LT_MIN_NODES     = 2
+_LT_MAX_NODES     = 20
 
 # Defaults for new resources created in card 4 (hardcoded per user choice).
 _DEFAULT_CLOUD       = "aws"
@@ -764,8 +847,8 @@ def _lt_emit(line: str) -> None:
         _lt_state["lines"].append(line)
 
 
-def _lt_provision_worker(env_id: str) -> None:
-    """Worker thread: ensure resources exist, then run provision_20_pipelines.py."""
+def _lt_provision_worker(env_id: str, num_pipelines: int, max_nodes: int) -> None:
+    """Worker thread: ensure resources exist, then run the provision script."""
     rc_final = 1
     try:
         _lt_emit(f"=== Setting up env {env_id} (creating any missing resources) ===")
@@ -775,9 +858,13 @@ def _lt_provision_worker(env_id: str) -> None:
             return
 
         _lt_emit("")
-        _lt_emit(f"=== Provisioning demo pipelines via {PROVISION_SCRIPT.name} ===")
+        _lt_emit(f"=== Provisioning {num_pipelines} pipeline(s) (max {max_nodes} nodes each) "
+                 f"via {PROVISION_SCRIPT.name} ===")
         argv = [sys.executable, str(PROVISION_SCRIPT),
-                "--env", env_id, "--config", str(CONFIG_YML), "--provision"]
+                "--env", env_id, "--config", str(CONFIG_YML),
+                "--num-pipelines", str(num_pipelines),
+                "--max-nodes",     str(max_nodes),
+                "--provision"]
         proc = subprocess.Popen(
             argv,
             cwd=str(REPO_DIR),
@@ -802,14 +889,19 @@ def _lt_provision_worker(env_id: str) -> None:
             _lt_state["rc"]   = rc_final
 
 
-def _lt_start_provision(env_id: str, mode: str = "provision") -> tuple[bool, str]:
+def _lt_start_provision(
+    env_id: str,
+    mode: str = "provision",
+    *,
+    num_pipelines: int = 10,
+    max_nodes: int = 4,
+) -> tuple[bool, str]:
     """Launch provision flow (with auto resource creation) or teardown for env_id.
 
     `provision` runs _lt_provision_worker (creates cluster/SR/Flink if missing,
     then runs the provision script). `teardown` just runs the script directly.
+    num_pipelines and max_nodes are clamped to the wizard input bounds.
     """
-    if _lt_running():
-        return False, "a provision/teardown is already running — Stop it first"
     if not PROVISION_SCRIPT.exists():
         return False, f"{PROVISION_SCRIPT} not found"
     if not re.match(r"^env-[A-Za-z0-9]+$", env_id):
@@ -817,9 +909,20 @@ def _lt_start_provision(env_id: str, mode: str = "provision") -> tuple[bool, str
     if mode not in ("provision", "teardown"):
         return False, "mode must be 'provision' or 'teardown'"
 
+    num_pipelines = max(_LT_MIN_PIPELINES, min(_LT_MAX_PIPELINES, num_pipelines))
+    max_nodes     = max(_LT_MIN_NODES,     min(_LT_MAX_NODES,     max_nodes))
+
     if mode == "provision":
-        # Reset state; the worker thread spawns its own subprocess after setup.
+        # Atomic check-and-claim: prevents two simultaneous /loadtest/start POSTs
+        # from both observing _lt_running()=False and both spawning a worker.
         with _lt_lock:
+            still_alive = (
+                not _lt_state["done"]
+                and _lt_state["started_at"] is not None
+                and (_lt_state["proc"] is None or _lt_state["proc"].poll() is None)
+            )
+            if still_alive:
+                return False, "a provision/teardown is already running — Stop it first"
             _lt_state.update({
                 "proc":       None,
                 "args":       ["<provision worker>", env_id],
@@ -829,9 +932,12 @@ def _lt_start_provision(env_id: str, mode: str = "provision") -> tuple[bool, str
                 "started_at": time.time(),
             })
         threading.Thread(
-            target=_lt_provision_worker, args=(env_id,), daemon=True,
+            target=_lt_provision_worker,
+            args=(env_id, num_pipelines, max_nodes),
+            daemon=True,
         ).start()
-        return True, f"provisioning started for {env_id} — streaming output below"
+        return True, (f"provisioning started for {env_id} — "
+                      f"{num_pipelines} pipeline(s), max {max_nodes} nodes each")
 
     # Teardown: env must already be configured with Kafka creds
     configured = {e["env_id"]: e for e in _configured_env_ids()}
@@ -843,6 +949,24 @@ def _lt_start_provision(env_id: str, mode: str = "provision") -> tuple[bool, str
     py = sys.executable
     argv = [py, str(PROVISION_SCRIPT),
             "--env", env_id, "--config", str(CONFIG_YML), "--teardown"]
+    # Atomic check-and-claim — same pattern as the provision branch above.
+    with _lt_lock:
+        still_alive = (
+            not _lt_state["done"]
+            and _lt_state["started_at"] is not None
+            and (_lt_state["proc"] is None or _lt_state["proc"].poll() is None)
+        )
+        if still_alive:
+            return False, "a provision/teardown is already running — Stop it first"
+        # Claim the slot before spawning so a concurrent caller sees us as busy.
+        _lt_state.update({
+            "proc":       None,
+            "args":       argv,
+            "lines":      deque(maxlen=_LT_RING_SIZE),
+            "done":       False,
+            "rc":         None,
+            "started_at": time.time(),
+        })
     proc = subprocess.Popen(
         argv,
         cwd=str(REPO_DIR),
@@ -851,14 +975,7 @@ def _lt_start_provision(env_id: str, mode: str = "provision") -> tuple[bool, str
         bufsize=0,
     )
     with _lt_lock:
-        _lt_state.update({
-            "proc":       proc,
-            "args":       argv,
-            "lines":      deque(maxlen=_LT_RING_SIZE),
-            "done":       False,
-            "rc":         None,
-            "started_at": time.time(),
-        })
+        _lt_state["proc"] = proc
     threading.Thread(target=_lt_pump, args=(proc,), daemon=True).start()
     return True, f"teardown started (pid {proc.pid}) — streaming output below"
 
@@ -899,7 +1016,7 @@ def _lt_status() -> dict:
 
 # Marquez-namespace teardown is no longer relevant — provisioning is now done
 # via real CC resources, and tearing down means deleting those CC resources
-# via `provision_20_pipelines.py --teardown`. Lineage in Marquez disappears
+# via `provision_demo_pipelines.py --teardown`. Lineage in Marquez disappears
 # naturally on the next bridge poll cycle (with ABORT events for removed jobs).
 
 
@@ -908,8 +1025,19 @@ def _lt_status() -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _bridge_running() -> bool:
-    proc = _bridge_state["proc"]
-    return proc is not None and proc.poll() is None
+    """True when the bridge is provisioning or the subprocess is alive."""
+    if _bridge_state["phase"] in ("provisioning", "running"):
+        proc = _bridge_state["proc"]
+        if _bridge_state["phase"] == "running":
+            return proc is not None and proc.poll() is None
+        return True
+    return False
+
+
+def _bridge_emit(line: str) -> None:
+    """Append a line to the bridge stream (used by the launcher thread)."""
+    with _bridge_lock:
+        _bridge_state["lines"].append(line)
 
 
 def _bridge_pump(proc: subprocess.Popen) -> None:
@@ -921,18 +1049,79 @@ def _bridge_pump(proc: subprocess.Popen) -> None:
         proc.wait()
     finally:
         with _bridge_lock:
-            _bridge_state["done"] = True
-            _bridge_state["rc"]   = proc.returncode
+            _bridge_state["done"]  = True
+            _bridge_state["phase"] = "done"
+            _bridge_state["rc"]    = proc.returncode
 
 
-def _bridge_start() -> tuple[bool, str]:
-    """Launch `ol-confluent run --config config.yaml` in the background."""
-    if _bridge_running():
-        return False, "OpenLineage bridge is already running"
-    if not _configured_env_ids():
-        return False, "no envs configured — pick env(s) in card 3 first"
+def _bridge_provision_pending() -> bool:
+    """Provision every env in selected_envs; move successes into environments.
 
-    # Prefer the venv binary; fall back to `python -m`
+    Streams progress lines into the bridge log. Returns True if all selected
+    envs were provisioned (or there were none to begin with), False on the
+    first failure.
+    """
+    pending = _read_selected_envs()
+    if not pending:
+        return True
+
+    _bridge_emit(f"⏳ provisioning {len(pending)} pending env(s) before bridge start…")
+    remaining = list(pending)
+    for entry in pending:
+        env_id   = entry["env_id"]
+        env_name = entry.get("env_name", "")
+        _bridge_emit(f"  → {env_id} ({env_name or 'no name'}): minting Kafka + SR keys")
+        try:
+            cfg_entry = _provision_env(env_id, env_name)
+        except Exception as exc:    # noqa: BLE001
+            _bridge_emit(f"  ✗ {env_id}: uncaught {exc}")
+            return False
+        for log_line in cfg_entry.get("_log", []):
+            _bridge_emit(f"    {log_line}")
+        if cfg_entry.get("_error"):
+            _bridge_emit(f"  ✗ {env_id}: {cfg_entry['_error']}")
+            # Persist any progress made so far (move successes out, keep failures pending)
+            _write_selected_envs(remaining)
+            return False
+        try:
+            _upsert_environment(cfg_entry)
+        except Exception as exc:    # noqa: BLE001
+            _bridge_emit(f"  ✗ {env_id}: failed to write config.yaml: {exc}")
+            _write_selected_envs(remaining)
+            return False
+        # Success: drop this env from the still-pending list
+        remaining = [r for r in remaining if r["env_id"] != env_id]
+        _write_selected_envs(remaining)
+        _bridge_emit(f"  ✓ {env_id}: provisioned")
+
+    return True
+
+
+def _bridge_launch_worker() -> None:
+    """Run provisioning then spawn ol-confluent run. Runs in a background thread.
+
+    Honors a Stop click that lands during provisioning: _bridge_stop() flips
+    phase to "done" while we're still in _bridge_provision_pending(). We
+    re-check phase under the lock both before and after spawning the
+    subprocess so we don't resurrect the bridge after the user cancelled.
+    """
+    try:
+        ok = _bridge_provision_pending()
+    except Exception as exc:    # noqa: BLE001
+        _bridge_emit(f"✗ provisioning crashed: {exc}")
+        ok = False
+
+    # Provisioning failed OR user clicked Stop while we were provisioning.
+    with _bridge_lock:
+        cancelled = _bridge_state["phase"] == "done"
+    if not ok or cancelled:
+        with _bridge_lock:
+            _bridge_state["done"]  = True
+            _bridge_state["phase"] = "done"
+            if _bridge_state["rc"] is None:
+                _bridge_state["rc"] = 1
+        return
+
     venv_bin = REPO_DIR / ".venv" / "bin" / "ol-confluent"
     if venv_bin.exists():
         argv = [str(venv_bin), "run", "--config", str(CONFIG_YML)]
@@ -940,30 +1129,92 @@ def _bridge_start() -> tuple[bool, str]:
         argv = [sys.executable, "-m", "openlineage_confluent.cli",
                 "run", "--config", str(CONFIG_YML)]
 
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(REPO_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
+    _bridge_emit(f"▶ spawning: {' '.join(argv)}")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(REPO_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    except Exception as exc:    # noqa: BLE001
+        _bridge_emit(f"✗ failed to spawn bridge: {exc}")
+        with _bridge_lock:
+            _bridge_state["done"]  = True
+            _bridge_state["phase"] = "done"
+            _bridge_state["rc"]    = 1
+        return
 
+    # Recheck under lock — if Stop landed between the cancel check above and
+    # this point (rare but possible), kill the just-spawned proc and bail
+    # before _bridge_pump enters its blocking readline loop.
     with _bridge_lock:
+        if _bridge_state["phase"] == "done":
+            _bridge_emit("✗ stop arrived after spawn — terminating just-spawned bridge")
+            try:
+                proc.kill()
+            except Exception:    # noqa: BLE001
+                pass
+            return
+        _bridge_state["proc"]  = proc
+        _bridge_state["args"]  = argv
+        _bridge_state["phase"] = "running"
+
+    _bridge_pump(proc)
+
+
+def _bridge_start() -> tuple[bool, str]:
+    """Kick off (provisioning + ol-confluent run) in a background thread.
+
+    Returns immediately. Provisioning of any envs in confluent.selected_envs
+    streams into the bridge log, then the subprocess is spawned.
+    """
+    pending      = _read_selected_envs()
+    provisioned  = [e for e in _configured_env_ids() if not e["pending"]]
+    if not pending and not provisioned:
+        return False, "no envs configured — pick env(s) in card 3 first"
+
+    # Atomic check-and-claim: prevents two simultaneous /bridge/start POSTs
+    # from both observing phase=idle and both spawning a launcher thread.
+    with _bridge_lock:
+        if _bridge_state["phase"] in ("provisioning", "running"):
+            proc = _bridge_state["proc"]
+            still_alive = (
+                _bridge_state["phase"] == "provisioning"
+                or (proc is not None and proc.poll() is None)
+            )
+            if still_alive:
+                return False, "OpenLineage bridge is already running"
         _bridge_state.update({
-            "proc":       proc,
-            "args":       argv,
+            "proc":       None,
+            "args":       [],
             "lines":      deque(maxlen=_BRIDGE_RING_SIZE),
+            "phase":      "provisioning" if pending else "running",
             "done":       False,
             "rc":         None,
             "started_at": time.time(),
         })
 
-    threading.Thread(target=_bridge_pump, args=(proc,), daemon=True).start()
-    return True, f"started (pid {proc.pid})"
+    threading.Thread(target=_bridge_launch_worker, daemon=True).start()
+
+    if pending:
+        return True, f"starting (provisioning {len(pending)} env(s) first)"
+    return True, "starting"
 
 
 def _bridge_stop() -> tuple[bool, str]:
+    # If we're still provisioning, there's no subprocess to kill yet — flip the
+    # phase to done and let the launcher thread bail on its next emit.
+    if _bridge_state["phase"] == "provisioning" and _bridge_state["proc"] is None:
+        with _bridge_lock:
+            _bridge_state["done"]  = True
+            _bridge_state["phase"] = "done"
+            _bridge_state["rc"]    = 130    # SIGINT-ish
+        _bridge_emit("✗ stopped during provisioning")
+        return True, "stopped during provisioning"
+
     proc = _bridge_state["proc"]
     if proc is None or proc.poll() is not None:
         return False, "bridge is not running"
@@ -983,6 +1234,7 @@ def _bridge_stop() -> tuple[bool, str]:
 def _bridge_status() -> dict:
     return {
         "running":    _bridge_running(),
+        "phase":      _bridge_state["phase"],
         "done":       _bridge_state["done"],
         "rc":         _bridge_state["rc"],
         "args":       _bridge_state["args"],
@@ -1191,8 +1443,15 @@ PAGE = """<!doctype html>
       Tick every environment you want OpenLineage to track — selection is at the
       environment level, so the bridge will pick up <strong>all</strong> resources in
       each chosen env (Connect, Flink, ksqlDB, Tableflow, producers, consumers).
-      Saving runs the Confluent CLI behind the scenes to mint a Kafka cluster
-      key + Schema Registry key per env and writes them to <code>config.yaml</code>.
+    </div>
+    <div class="card-help" style="margin-top:.5rem; padding:.5rem .65rem; background:#1a1f2e; border-left:3px solid #d29922; border-radius:3px;">
+      <strong>⚠ Cloud API key permissions:</strong> the key in <code>config.yaml</code>
+      (<code>CONFLUENT_CLOUD_API_KEY</code>) must have <strong>MetricsViewer</strong>
+      (org or env scope) and <strong>CloudClusterAdmin</strong> (or env-level
+      Connect access). Without these, producer/consumer/throughput lineage and
+      managed Connect lineage return <code>401</code> and silently drop out of
+      the graph. Grant the roles in the Confluent Cloud UI under
+      <em>Accounts &amp; access → Service accounts / Users</em>.
     </div>
     <div class="env-list" id="env-list"></div>
     <div class="btn-row">
@@ -1202,10 +1461,8 @@ PAGE = """<!doctype html>
     <div class="status" id="env-status"></div>
 
     <div class="divider"></div>
-    <div class="card-help" style="margin-bottom:.5rem">
-      Start the bridge to begin polling the selected environments and forwarding
-      lineage to Marquez. Runs <code>ol-confluent run --config config.yaml</code>
-      in the background; stop any time.
+    <div class="card-help" id="bridge-intro" style="margin-bottom:.5rem">
+      No environments selected — pick at least one above.
     </div>
     <div class="btn-row">
       <button id="bridge-start-btn" onclick="bridgeStart()">Start OpenLineage</button>
@@ -1230,12 +1487,8 @@ PAGE = """<!doctype html>
       <span class="card-title">Generate demo pipelines in Confluent Cloud</span>
     </div>
     <div class="card-help">
-      Provisions <strong>real</strong> demo pipelines (Datagen sources + Flink
-      enrichment statements + consumer groups) into the selected Confluent
-      Cloud environment. The bridge picks them up via normal CC APIs and
-      forwards lineage to Marquez. <strong>No synthetic events are sent
-      directly</strong> — all load arrives through real Confluent activity.
-      <em>Delete</em> tears every provisioned resource back down via the CLI.
+      Creates new test pipelines on Confluent Cloud — they'll show up in the
+      lineage sync like any other workload.
     </div>
     <div class="form-grid">
       <div class="field-pair">
@@ -1245,11 +1498,31 @@ PAGE = """<!doctype html>
                                    font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
         </select>
       </div>
+      <div class="field-pair">
+        <label>Number of pipelines</label>
+        <input id="lt-num-pipelines" type="number" min="1" max="50" value="5"
+               style="width:100%; background:#0d1117; border:1px solid #30363d;
+                      border-radius:4px; color:#c9d1d9; padding:.45rem .6rem;
+                      font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
+      </div>
+      <div class="field-pair">
+        <label>Max nodes per pipeline</label>
+        <input id="lt-max-nodes" type="number" min="2" max="20" value="4"
+               style="width:100%; background:#0d1117; border:1px solid #30363d;
+                      border-radius:4px; color:#c9d1d9; padding:.45rem .6rem;
+                      font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
+      </div>
+    </div>
+    <div class="card-help" style="margin-top:.4rem; font-size:.8rem;">
+      Each pipeline gets a random length in [2, max nodes]. A node = a job
+      (Datagen connector / Flink statement / consumer group). One Flink
+      statement uses one CFU — keep <em>num × max</em> within your compute
+      pool's CFU budget (default 10).
     </div>
     <div class="btn-row">
       <button id="lt-start-btn"    onclick="ltStart()">Provision demo pipelines</button>
       <button id="lt-stop-btn"     onclick="ltStop()"     class="danger" disabled>Stop</button>
-      <button id="lt-teardown-btn" onclick="ltTeardown()" class="secondary">Delete from Confluent Cloud</button>
+      <button id="lt-teardown-btn" onclick="ltTeardown()" class="secondary">Delete all demo pipelines</button>
     </div>
     <div class="status" id="lt-status"></div>
     <pre id="lt-log" class="log hidden"></pre>
@@ -1363,13 +1636,19 @@ async function loadEnvironments() {
     return;
   }
 
-  const configured = new Set(
-    (configuredResp.d.environments || []).map(e => e.env_id)
+  // Map env_id → {pending: bool} so we can distinguish "selected" (pending
+  // provisioning) from "provisioned" (already has Kafka/SR keys minted).
+  const configured = new Map(
+    (configuredResp.d.environments || []).map(e => [e.env_id, {pending: !!e.pending}])
   );
 
   list.innerHTML = '';
   for (const e of envs) {
-    const isChecked = configured.has(e.id);
+    const cfg       = configured.get(e.id);
+    const isChecked = !!cfg;
+    const isPending = cfg ? cfg.pending : false;
+    const label     = isChecked ? (isPending ? '✓ selected' : '✓ provisioned') : '';
+    const cls       = isChecked ? (isPending ? 'selected' : 'saved') : '';
     const row = document.createElement('label');
     row.className = 'env-row' + (isChecked ? ' selected' : '');
     row.innerHTML =
@@ -1377,33 +1656,44 @@ async function loadEnvironments() {
         escapeHtml(e.name) + '"' + (isChecked ? ' checked' : '') + '>' +
       '<span class="env-name">' + escapeHtml(e.name) + '</span>' +
       '<span class="env-id">' + e.id + '</span>' +
-      '<span class="env-status' + (isChecked ? ' saved' : '') +
-        '" id="env-stat-' + e.id + '">' +
-        (isChecked ? '✓ saved' : '') + '</span>';
+      '<span class="env-status ' + cls + '" id="env-stat-' + e.id + '">' +
+        label + '</span>';
     const cb = row.querySelector('input');
     cb.addEventListener('change', () => {
       row.classList.toggle('selected', cb.checked);
-      saveBtn.disabled = !document.querySelectorAll('#env-list input:checked').length;
+      saveBtn.disabled = false;     // any change (check or uncheck) is saveable
     });
     list.appendChild(row);
   }
-  saveBtn.disabled = !document.querySelectorAll('#env-list input:checked').length;
+  saveBtn.disabled = false;        // allow saving an empty selection (clears it)
+  updateBridgeIntro(envs, configured);
+}
+
+function updateBridgeIntro(envs, configured) {
+  const intro = document.getElementById('bridge-intro');
+  if (!intro) return;
+  const nameById = new Map(envs.map(e => [e.id, e.name]));
+  const selected = Array.from(configured.keys()).map(id => ({
+    id, name: nameById.get(id) || ''
+  }));
+  if (selected.length === 0) {
+    intro.innerHTML = 'No environments selected — pick at least one above.';
+    return;
+  }
+  const list = selected.map(e =>
+    '<strong>' + escapeHtml(e.name || e.id) + '</strong> <span class="dim">(' + e.id + ')</span>'
+  ).join(', ');
+  const verb = selected.length === 1 ? 'is' : 'are';
+  intro.innerHTML = list + ' ' + verb +
+    ' selected. Click below to start the OpenLineage flow.';
 }
 
 async function saveEnvs() {
   const checked = Array.from(document.querySelectorAll('#env-list input:checked'));
-  if (checked.length === 0) return;
   const stat = document.getElementById('env-status');
   const saveBtn = document.getElementById('env-save-btn');
   saveBtn.disabled = true;
-  stat.innerHTML = '<span class="dim">provisioning ' + checked.length + ' environment(s)…</span>';
-
-  // Mark each row as pending
-  for (const cb of checked) {
-    const id = cb.dataset.envId;
-    const cell = document.getElementById('env-stat-' + id);
-    if (cell) { cell.textContent = '… working'; cell.className = 'env-status pending'; }
-  }
+  stat.innerHTML = '<span class="dim">saving selection…</span>';
 
   const payload = {
     envs: checked.map(cb => ({env_id: cb.dataset.envId, env_name: cb.dataset.envName})),
@@ -1420,26 +1710,15 @@ async function saveEnvs() {
     return;
   }
 
-  let okCount = 0;
-  for (const result of d.results || []) {
-    const cell = document.getElementById('env-stat-' + result.env_id);
-    if (!cell) continue;
-    if (result.ok) {
-      cell.textContent = '✓ saved';
-      cell.className = 'env-status saved';
-      okCount++;
-    } else {
-      cell.textContent = '✗ ' + (result.error || 'failed').slice(0, 60);
-      cell.className = 'env-status failed';
-    }
-  }
+  // Re-render the env list so labels reflect the new pending/provisioned state.
+  await loadEnvironments();
 
-  stat.innerHTML = okCount > 0
-    ? '<span class="ok">✓ ' + okCount + ' env(s) saved to config.yaml</span>'
-    : '<span class="err">✗ all envs failed — see per-row errors</span>';
-  document.getElementById('done-env').textContent = okCount;
-  if (okCount > 0) document.getElementById('done-card').classList.remove('hidden');
-  saveBtn.disabled = false;
+  const n = checked.length;
+  stat.innerHTML = n > 0
+    ? '<span class="ok">✓ ' + n + ' env(s) selected — Kafka + SR keys are minted on Start OpenLineage</span>'
+    : '<span class="dim">selection cleared</span>';
+  document.getElementById('done-env').textContent = n;
+  if (n > 0) document.getElementById('done-card').classList.remove('hidden');
   // Refresh load-test card env dropdown
   populateLoadTestEnvs();
 }
@@ -1595,20 +1874,23 @@ async function populateLoadTestEnvs() {
 
 async function ltStart() {
   const env  = document.getElementById('lt-env').value;
+  const num  = parseInt(document.getElementById('lt-num-pipelines').value, 10) || 5;
+  const max  = parseInt(document.getElementById('lt-max-nodes').value, 10) || 4;
   const stat = document.getElementById('lt-status');
   if (!env) {
     stat.innerHTML = '<span class="err">pick a target environment first</span>';
     return;
   }
   document.getElementById('lt-start-btn').disabled = true;
-  stat.innerHTML = '<span class="dim">provisioning Datagen + Flink + consumers in CC…</span>';
+  stat.innerHTML = '<span class="dim">provisioning ' + num + ' pipeline(s), max ' + max +
+                   ' nodes each…</span>';
   document.getElementById('lt-log').classList.remove('hidden');
   document.getElementById('lt-log').textContent = '';
   try {
     const r = await fetch('/loadtest/start', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({env_id: env}),
+      body: JSON.stringify({env_id: env, num_pipelines: num, max_nodes: max}),
     });
     const d = await r.json();
     if (!r.ok) {
@@ -1666,7 +1948,7 @@ async function ltTeardown() {
                'This cannot be undone.')) return;
   const btn = document.getElementById('lt-teardown-btn');
   btn.disabled = true;
-  stat.innerHTML = '<span class="dim">running provision_20_pipelines.py --teardown…</span>';
+  stat.innerHTML = '<span class="dim">deleting all ol-* demo pipelines (state-tracked + stateless sweep)…</span>';
   document.getElementById('lt-log').classList.remove('hidden');
   document.getElementById('lt-log').textContent = '';
   try {
@@ -1840,7 +2122,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/envs/select":
             envs = data.get("envs") or []
-            if not isinstance(envs, list) or not envs:
+            if not isinstance(envs, list):
                 self._send_json(400, {"error": "envs (list) required"})
                 return
             user = _current_user()
@@ -1848,6 +2130,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "not signed in"})
                 return
 
+            # Lazy: persist the selection only. Cluster + key minting happens on
+            # Start OpenLineage (see _bridge_start) so the user can pick freely
+            # without burning API keys or surfacing CLI errors per save.
+            already_provisioned = {e["env_id"] for e in _configured_env_ids() if not e["pending"]}
+            cleaned: list[dict] = []
             results: list[dict] = []
             for entry in envs:
                 env_id   = (entry.get("env_id")   or "").strip()
@@ -1855,22 +2142,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not env_id:
                     results.append({"env_id": "", "ok": False, "error": "missing env_id"})
                     continue
-                try:
-                    cfg_entry = _provision_env(env_id, env_name)
-                    if cfg_entry.get("_error"):
-                        results.append({
-                            "env_id": env_id, "ok": False,
-                            "error": cfg_entry["_error"],
-                            "log":   cfg_entry.get("_log", []),
-                        })
-                        continue
-                    _upsert_environment(cfg_entry)
-                    results.append({
-                        "env_id": env_id, "ok": True,
-                        "log":    cfg_entry.get("_log", []),
-                    })
-                except Exception as exc:    # noqa: BLE001
-                    results.append({"env_id": env_id, "ok": False, "error": str(exc)})
+                # Don't shadow a fully-provisioned env with a pending entry.
+                if env_id not in already_provisioned:
+                    cleaned.append({"env_id": env_id, "env_name": env_name})
+                results.append({"env_id": env_id, "ok": True})
+
+            try:
+                _write_selected_envs(cleaned)
+            except Exception as exc:    # noqa: BLE001
+                self._send_json(500, {"error": f"failed to write config.yaml: {exc}"})
+                return
 
             self._send_json(200, {"results": results})
 
@@ -1889,7 +2170,16 @@ class Handler(BaseHTTPRequestHandler):
             if not env_id:
                 self._send_json(400, {"error": "env_id required"})
                 return
-            ok, msg = _lt_start_provision(env_id, mode="provision")
+            try:
+                num_pipelines = int(data.get("num_pipelines", 10))
+                max_nodes     = int(data.get("max_nodes",     4))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "num_pipelines and max_nodes must be integers"})
+                return
+            ok, msg = _lt_start_provision(
+                env_id, mode="provision",
+                num_pipelines=num_pipelines, max_nodes=max_nodes,
+            )
             if not ok:
                 self._send_json(409 if "running" in msg else 400, {"error": msg})
                 return
