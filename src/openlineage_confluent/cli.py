@@ -63,12 +63,26 @@ def run(
     config: Annotated[Optional[Path], typer.Option("--config", "-c")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Run continuously, polling on the configured interval."""
+    """Run continuously, waiting `poll_interval_seconds` between cycles.
+
+    When --config is provided, the file is re-read at the top of every cycle
+    and the lineage client is rebuilt if the env list changed — so adds /
+    removals / key rotations made via the wizard are picked up without
+    restarting the bridge.
+    """
+    import signal
+
     _setup_logging(verbose)
     from openlineage_confluent.pipeline import LineagePipeline
 
     cfg = _load_config(config)
-    with LineagePipeline(cfg) as pipeline:
+    with LineagePipeline(cfg, config_path=config) as pipeline:
+        # SIGTERM (sent by the wizard's Stop button via subprocess.Popen.send_signal)
+        # interrupts the post-cycle wait immediately. SIGINT (Ctrl+C) is handled
+        # inside run_forever via KeyboardInterrupt.
+        def _on_sigterm(_signum: int, _frame: object) -> None:
+            pipeline.stop()
+        signal.signal(signal.SIGTERM, _on_sigterm)
         pipeline.run_forever()
 
 

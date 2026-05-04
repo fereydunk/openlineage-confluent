@@ -13,7 +13,6 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "openlineage-python>=1.19",
-    "apscheduler>=3.10",
     "PyYAML>=6.0",
     "rich>=13.7",          # pretty CLI output
     "typer>=0.12",         # CLI
