@@ -237,6 +237,14 @@ class LineageGraph(BaseModel):
     # topic name → throughput over the metrics lookback window
     topic_throughput: dict[str, TopicThroughput] = Field(default_factory=dict)
 
+    # OL job-namespace prefixes (e.g. "kafka-connect://env-aaa") whose source
+    # fetch failed this cycle (401, 5xx, network error, CLI subprocess crash).
+    # The emitter consults this set to suppress removal-detection for jobs in
+    # these namespaces — a transient auth/network blip must not synthesize a
+    # fake ABORT that wipes lineage in Marquez. Successful next poll picks
+    # them back up; persistent failures keep them quarantined indefinitely.
+    failed_namespaces: set[str] = Field(default_factory=set)
+
     def summary(self) -> dict[str, int]:
         managed  = sum(1 for c in self.connectors if c.connect_cluster is None)
         self_mgd = sum(1 for c in self.connectors if c.connect_cluster is not None)

@@ -46,6 +46,17 @@ class KsqlDbClient:
             timeout=timeout,
             headers=_KSQL_HEADERS,
         )
+        # True after the most recent get_queries() call returned authoritatively.
+        # False on any underlying ksqlDB REST error — empty result must then
+        # be treated as "unknown," not "no queries."
+        self.last_ok: bool = True
+
+    @property
+    def cluster_id(self) -> str:
+        """Public accessor used by ConfluentLineageClient when building the
+        merged graph's failed_namespaces set. Exposing this avoids reaching
+        into the private _cluster attribute from another module."""
+        return self._cluster.cluster_id
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -53,6 +64,7 @@ class KsqlDbClient:
 
     def get_queries(self) -> list[KsqlQuery]:
         """Return all persistent queries with resolved Kafka topic bindings."""
+        self.last_ok = True
         topic_map = self._build_topic_map()
         return self._fetch_queries(topic_map)
 
@@ -67,6 +79,7 @@ class KsqlDbClient:
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
+            self.last_ok = False
             log.warning(
                 "[ksqlDB %s] statement failed (%r): %s",
                 self._cluster.cluster_id, statement.strip(), exc,

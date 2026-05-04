@@ -48,6 +48,17 @@ class SelfManagedConnectClient:
             timeout=timeout,
             headers={"Accept": "application/json"},
         )
+        # True after the most recent get_connectors() call returned authoritatively.
+        # False on any HTTP error — empty result must then be treated as
+        # "unknown," not "no connectors."
+        self.last_ok: bool = True
+
+    @property
+    def cluster_name(self) -> str:
+        """Public accessor used by ConfluentLineageClient when building the
+        merged graph's failed_namespaces set. Exposing this avoids reaching
+        into the private _name attribute from another module."""
+        return self._name
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -60,6 +71,7 @@ class SelfManagedConnectClient:
         the cluster's configured name, so the mapper uses the correct
         namespace: kafka-connect://<cluster_name>.
         """
+        self.last_ok = True
         raw = self._fetch_all()
         connectors: list[ConnectorInfo] = []
 
@@ -101,9 +113,11 @@ class SelfManagedConnectClient:
                     self._name,
                 )
                 return self._fetch_individually()
+            self.last_ok = False
             log.warning("[%s] failed to list connectors: %s", self._name, exc)
             return {}
         except Exception as exc:
+            self.last_ok = False
             log.warning("[%s] failed to list connectors: %s", self._name, exc)
             return {}
 
@@ -114,6 +128,7 @@ class SelfManagedConnectClient:
             resp.raise_for_status()
             names: list[str] = resp.json()
         except Exception as exc:
+            self.last_ok = False
             log.warning("[%s] failed to list connector names: %s", self._name, exc)
             return {}
 
@@ -130,6 +145,11 @@ class SelfManagedConnectClient:
                     "status": status_r.json(),
                 }
             except Exception as exc:
+                # Per-connector failure means we don't know the connector's
+                # current state. Mark the whole fetch as untrustworthy so the
+                # emitter quarantines this cluster's namespace and doesn't
+                # synthesize a phantom ABORT for the missing connector.
+                self.last_ok = False
                 log.warning("[%s] failed to fetch connector %s: %s", self._name, name, exc)
 
         return result

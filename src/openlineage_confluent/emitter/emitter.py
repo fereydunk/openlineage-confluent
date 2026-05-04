@@ -125,18 +125,49 @@ class LineageEmitter:
                  len(event.outputs or []))
         return True
 
-    def emit_batch(self, events: list[RunEvent], *, force: bool = False) -> tuple[int, int, int]:
+    def emit_batch(
+        self,
+        events: list[RunEvent],
+        *,
+        force: bool = False,
+        failed_namespaces: set[str] | None = None,
+    ) -> tuple[int, int, int]:
         """Emit a list of events concurrently. Returns (emitted, skipped, removed).
 
         Removal detection: any job previously seen that is absent from *events*
-        receives a serial ABORT RunEvent before the parallel emission begins.
+        normally receives a serial ABORT RunEvent. EXCEPT for jobs whose
+        namespace is in `failed_namespaces` — those are quarantined: we don't
+        know whether they were really removed or just unfetchable this cycle
+        (auth, network, 5xx), so we leave them in `_known_jobs` untouched and
+        skip the ABORT. The next successful poll will either re-emit them
+        normally or finally remove them.
+
         State is flushed to SQLite after all events are processed.
         """
+        failed_namespaces = failed_namespaces or set()
         current_keys = {f"{e.job.namespace}/{e.job.name}" for e in events}
 
         # — detect removals under lock (needs full dict scan) —
+        # Suppress ABORTs for jobs whose source failed: those jobs stay in
+        # _known_jobs so a subsequent successful poll can pick up where we
+        # left off without losing diff-state.
         with self._lock:
-            removed_keys = [k for k in self._known_jobs if k not in current_keys]
+            removed_keys = []
+            quarantined  = 0
+            for k, (ns, _) in self._known_jobs.items():
+                if k in current_keys:
+                    continue
+                if ns in failed_namespaces:
+                    quarantined += 1
+                    continue
+                removed_keys.append(k)
+
+        if quarantined:
+            log.info(
+                "Suppressed removal-detection for %d known job(s) in failed "
+                "namespaces (%s) — will retry next cycle.",
+                quarantined, sorted(failed_namespaces),
+            )
 
         # — emit ABORT for each removed job (serial — typically a small set) —
         for job_key in removed_keys:

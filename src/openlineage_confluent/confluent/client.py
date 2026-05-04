@@ -98,6 +98,13 @@ class _EnvLineageClient:
                 timeout=timeout,
             )
 
+        # Per-source health flags. Set True after a successful fetch (incl.
+        # zero rows), False on HTTP/CLI error. Read by build_graph() to
+        # populate LineageGraph.failed_namespaces — empty results from a
+        # failed fetch must not be interpreted as "the resources were removed."
+        self._connect_ok: bool = True
+        self._flink_ok:   bool = True
+
     # ──────────────────────────────────────────────────────────────────────────
     # Managed Connect
     # ──────────────────────────────────────────────────────────────────────────
@@ -105,6 +112,7 @@ class _EnvLineageClient:
     def list_connectors(self) -> list[ConnectorInfo]:
         env     = self._env.env_id
         cluster = self._env.cluster_id
+        self._connect_ok = True
         try:
             resp = self._http.get(
                 f"/connect/v1/environments/{env}/clusters/{cluster}/connectors",
@@ -112,6 +120,7 @@ class _EnvLineageClient:
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:
+            self._connect_ok = False
             log.warning("Connect API fetch failed for env=%s: %s", env, exc)
             return []
         raw: dict[str, Any] = resp.json()
@@ -141,6 +150,7 @@ class _EnvLineageClient:
 
     def list_flink_statements(self) -> list[FlinkStatement]:
         env = self._env.env_id
+        self._flink_ok = True
         try:
             result = subprocess.run(
                 ["confluent", "flink", "statement", "list",
@@ -148,11 +158,13 @@ class _EnvLineageClient:
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
+                self._flink_ok = False
                 log.warning("confluent flink statement list (env=%s) failed: %s",
                             env, result.stderr[:300])
                 return []
             raw: list[dict[str, Any]] = json.loads(result.stdout)
         except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as exc:
+            self._flink_ok = False
             log.warning("Failed to list Flink statements for env=%s: %s", env, exc)
             return []
 
@@ -334,11 +346,30 @@ class _EnvLineageClient:
         except Exception as exc:    # noqa: BLE001
             log.warning("Topic throughput fetch failed for env=%s: %s", env, exc)
 
+        # Build the failed-namespace set: a fetch failure means we couldn't
+        # observe that source's resources this cycle, so the emitter must NOT
+        # interpret their absence from `edges` as a removal. The namespaces
+        # below are the OL job-namespace prefixes the mapper would assign.
+        failed_namespaces: set[str] = set()
+        if not self._connect_ok:
+            failed_namespaces.add(f"kafka-connect://{env}")
+        if not self._flink_ok:
+            failed_namespaces.add(f"flink://{env}")
+        if not self._metrics.producers_ok:
+            failed_namespaces.add(f"kafka-producer://{cluster}")
+        if not self._metrics.consumer_groups_ok:
+            failed_namespaces.add(f"kafka-consumer-group://{cluster}")
+        if not self._tableflow.last_ok:
+            failed_namespaces.add(f"tableflow://{env}")
+        # Throughput failures only affect dataset-level facets, not jobs —
+        # not added to failed_namespaces (no jobs to suppress removal for).
+
         log.info(
-            "env=%s: %d edges (managed=%d flink=%d producers=%d cg=%d tf=%d)",
+            "env=%s: %d edges (managed=%d flink=%d producers=%d cg=%d tf=%d) failed_sources=%s",
             env, len(edges),
             len(managed_connectors), len(statements),
             len(producers), len(consumer_groups), len(tableflow_topics),
+            sorted(failed_namespaces) or "[]",
         )
 
         return LineageGraph(
@@ -351,6 +382,7 @@ class _EnvLineageClient:
             topic_schemas=topic_schemas,
             topic_metadata=topic_metadata,
             topic_throughput=topic_throughput,
+            failed_namespaces=failed_namespaces,
         )
 
     def close(self) -> None:
@@ -484,6 +516,7 @@ class ConfluentLineageClient:
         topic_metadata:      dict[str, TopicMetadata]    = {}
         topic_throughput:    dict[str, TopicThroughput]  = {}
 
+        failed_namespaces: set[str] = set()
         for g in per_env_graphs:
             all_edges.extend(g.edges)
             all_managed_conns.extend(g.connectors)
@@ -494,17 +527,36 @@ class ConfluentLineageClient:
             topic_schemas.update(g.topic_schemas)
             topic_metadata.update(g.topic_metadata)
             topic_throughput.update(g.topic_throughput)
+            failed_namespaces.update(g.failed_namespaces)
+
+        # Global sources: ksqlDB queries and self-managed Connect clusters.
+        # Failures here also need to suppress removal-detection for jobs in
+        # the corresponding namespaces.
+        for c in self._ksql_clients:
+            if not c.last_ok:
+                failed_namespaces.add(f"ksqldb://{c.cluster_id}")
+        for c in self._sm_connect_clients:
+            if not c.last_ok:
+                failed_namespaces.add(f"kafka-connect://{c.cluster_name}")
 
         all_connectors = all_managed_conns + sm_connectors
 
         log.info(
             "Merged graph across %d envs: %d edges (managed=%d self-managed=%d "
-            "flink=%d producers=%d cg=%d ksqlDB=%d tableflow=%d)",
+            "flink=%d producers=%d cg=%d ksqlDB=%d tableflow=%d) failed_sources=%s",
             len(self._envs), len(all_edges),
             len(all_managed_conns), len(sm_connectors),
             len(all_statements), len(all_producers),
             len(all_consumer_groups), len(ksql_queries), len(all_tableflow),
+            sorted(failed_namespaces) or "[]",
         )
+        if failed_namespaces:
+            log.warning(
+                "%d source(s) failed to fetch this cycle — removal-detection "
+                "suppressed for: %s. Fix auth/network and the next cycle will "
+                "resume normal diff-tracking.",
+                len(failed_namespaces), sorted(failed_namespaces),
+            )
 
         return LineageGraph(
             edges=all_edges,
@@ -517,6 +569,7 @@ class ConfluentLineageClient:
             topic_schemas=topic_schemas,
             topic_metadata=topic_metadata,
             topic_throughput=topic_throughput,
+            failed_namespaces=failed_namespaces,
         )
 
     # ──────────────────────────────────────────────────────────────────────────

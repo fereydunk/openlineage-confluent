@@ -27,9 +27,15 @@ class TableflowClient:
     def __init__(self, env_id: str, cluster_id: str) -> None:
         self._env     = env_id
         self._cluster = cluster_id
+        # True after the most recent list_topics() call returned authoritatively
+        # (incl. an empty list when the CLI confirms "None found"). False when
+        # the CLI was missing, timed out, or errored — callers must treat an
+        # empty result in that case as "unknown" rather than "no topics."
+        self.last_ok: bool = True
 
     def list_topics(self) -> list[TableflowTopic]:
         """Return all active Tableflow topics for the configured cluster."""
+        self.last_ok = True
         try:
             result = subprocess.run(
                 [
@@ -42,6 +48,7 @@ class TableflowClient:
             )
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             log.warning("confluent tableflow topic list failed: %s", exc)
+            self.last_ok = False
             return []
 
         if result.returncode != 0:
@@ -50,6 +57,7 @@ class TableflowClient:
             if "None found" in result.stdout or not stderr:
                 return []
             log.warning("confluent tableflow topic list error: %s", stderr[:300])
+            self.last_ok = False
             return []
 
         stdout = result.stdout.strip()
@@ -60,6 +68,7 @@ class TableflowClient:
             raw: list[dict] = json.loads(stdout)
         except json.JSONDecodeError as exc:
             log.warning("Failed to parse tableflow topic list JSON: %s | output=%s", exc, stdout[:200])
+            self.last_ok = False
             return []
 
         topics: list[TableflowTopic] = []

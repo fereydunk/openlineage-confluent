@@ -108,6 +108,15 @@ class MetricsApiClient:
         self._extra            = tuple(cfg.consumer_group_exclude_prefixes)
         self._extra_producer   = tuple(cfg.producer_client_id_exclude_prefixes)
 
+        # Per-source health flags. Set True after a successful fetch (even if
+        # zero rows came back), False on any HTTP/network error. Reset by each
+        # public method's own call. Read by _EnvLineageClient.build_graph()
+        # to populate LineageGraph.failed_namespaces — empty results from a
+        # failed fetch must not be interpreted as "the resources were removed."
+        self.consumer_groups_ok: bool = True
+        self.producers_ok:       bool = True
+        self.throughput_ok:      bool = True
+
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────────────────────
@@ -119,8 +128,14 @@ class MetricsApiClient:
         configured lookback window (default: last 10 minutes) is included.
         Groups that are caught up (lag = 0) still appear — lag=0 means the
         group is active and up to date, not inactive.
+
+        Sets `self.consumer_groups_ok = False` if any underlying Metrics API
+        request failed (e.g. 401 — typical when the API key lacks the
+        MetricsViewer role). Callers must check this flag before treating an
+        empty list as "no consumer groups exist."
         """
-        rows = self._query_lag_metric()
+        rows, ok = self._query_lag_metric()
+        self.consumer_groups_ok = ok
 
         # Aggregate: group_id → set[topic]
         groups: dict[str, set[str]] = defaultdict(set)
@@ -155,10 +170,11 @@ class MetricsApiClient:
           connector-producer-*  — managed Connect source internal producer
           connector-*           — self-managed Connect source internal producer
         """
-        rows = self._query_paginated(
+        rows, ok = self._query_paginated(
             metric=_RECEIVED_BYTES,
             group_by=["metric.topic", "metric.client_id"],
         )
+        self.producers_ok = ok
 
         clients: dict[str, set[str]] = defaultdict(set)
         for row in rows:
@@ -191,8 +207,12 @@ class MetricsApiClient:
         agg: dict[str, TopicThroughput] = defaultdict(
             lambda: TopicThroughput(topic="", window_minutes=self._lookback)
         )
+        all_ok = True
         for metric in _THROUGHPUT_METRICS:
-            for row in self._query_topic_metric(metric):
+            rows, ok = self._query_topic_metric(metric)
+            if not ok:
+                all_ok = False
+            for row in rows:
                 topic = row.get("metric.topic")
                 value = row.get("value")
                 if not topic or value is None:
@@ -211,6 +231,7 @@ class MetricsApiClient:
                     bucket.records_out += int(value)
 
         result = dict(sorted(agg.items()))
+        self.throughput_ok = all_ok
         log.info(
             "Metrics API: throughput for %d topics (window=%d min)",
             len(result), self._lookback,
@@ -237,19 +258,32 @@ class MetricsApiClient:
         start = now - timedelta(minutes=self._lookback)
         return f"{start.isoformat()}/{now.isoformat()}"
 
-    def _query_lag_metric(self) -> list[dict]:
-        """Fetch all rows for consumer_lag_offsets, handling pagination."""
+    def _query_lag_metric(self) -> tuple[list[dict], bool]:
+        """Fetch all rows for consumer_lag_offsets, handling pagination.
+
+        Returns (rows, ok). ok=False signals an HTTP error (auth, network,
+        5xx) — the rows list will be empty or partially-populated and must
+        not be interpreted as authoritative.
+        """
         return self._query_paginated(
             metric=_LAG_METRIC,
             group_by=["metric.consumer_group_id", "metric.topic"],
         )
 
-    def _query_topic_metric(self, metric: str) -> list[dict]:
-        """Fetch all rows for a single topic-grouped metric."""
+    def _query_topic_metric(self, metric: str) -> tuple[list[dict], bool]:
+        """Fetch all rows for a single topic-grouped metric. Returns (rows, ok)."""
         return self._query_paginated(metric=metric, group_by=["metric.topic"])
 
-    def _query_paginated(self, *, metric: str, group_by: list[str]) -> list[dict]:
-        """Generic paginated POST against /v2/metrics/cloud/query."""
+    def _query_paginated(
+        self, *, metric: str, group_by: list[str]
+    ) -> tuple[list[dict], bool]:
+        """Generic paginated POST against /v2/metrics/cloud/query.
+
+        Returns (rows, ok). ok=False on the first HTTP error encountered;
+        any rows accumulated before the failure are still returned for
+        debugging, but the caller MUST treat the result as untrustworthy
+        and not as a complete view of the underlying resources.
+        """
         payload: dict = {
             "aggregations": [{"metric": metric, "agg": "SUM"}],
             "filter": {
@@ -265,6 +299,7 @@ class MetricsApiClient:
 
         rows: list[dict] = []
         page_token: str | None = None
+        ok = True
 
         while True:
             if page_token:
@@ -274,6 +309,7 @@ class MetricsApiClient:
                 resp = self._http.post("/v2/metrics/cloud/query", json=payload)
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
+                ok = False
                 log.warning("Metrics API query failed (%s): %s", metric, exc)
                 break
 
@@ -288,8 +324,8 @@ class MetricsApiClient:
             if not page_token:
                 break
 
-        log.debug("Metrics API returned %d rows for %s", len(rows), metric)
-        return rows
+        log.debug("Metrics API returned %d rows for %s (ok=%s)", len(rows), metric, ok)
+        return rows, ok
 
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
