@@ -1,20 +1,27 @@
 """OpenLineage-Confluent setup wizard.
 
-Single-page web UI on http://localhost:8892 that walks the user through:
-  1. Sign in to Confluent Cloud (email + password, non-interactive via
-     CONFLUENT_CLOUD_EMAIL / CONFLUENT_CLOUD_PASSWORD env vars).
-  2. List environments + show them.
-  3. Pick an environment → write CONFLUENT_ENV_ID to config.yaml.
-
-The page does NOT mint API keys yet — that's a separate concern. It only
-gets the user to the point where they've identified which env to bridge.
+Single-page web UI on http://localhost:8892 that walks the user through a
+four-card flow: Marquez control → CC sign-in → multi-env selection (lazy save
+to confluent.selected_envs; provisioning deferred until Start) → demo-pipeline
+provisioning + bridge runner. Mints Kafka + SR API keys on demand and writes
+them into config.yaml's `environments:` list.
 
 Endpoints:
   GET  /                 — HTML wizard page
-  POST /cc-login         — {email, password} → runs `confluent login --save`
-  GET  /environments     — runs `confluent environment list -o json`
-  POST /env/select       — {env_id, env_name} → writes config.yaml
-  GET  /status           — current login + selected env state
+  GET  /status           — {user, env_count}
+  GET  /environments     — `confluent environment list -o json`
+  GET  /envs/configured  — currently-configured envs (applies legacy shim)
+  GET  /marquez/status   — marquez + patched UI process state
+  GET  /loadtest/status  — demo-pipeline provisioner state
+  GET  /loadtest/stream  — SSE log of provisioner subprocess
+  GET  /bridge/status    — bridge phase + run state
+  GET  /bridge/stream    — SSE log of bridge provisioning + ol-confluent run
+  POST /cc-login         — {email, password} → `confluent login --save`
+  POST /envs/select      — [{env_id, env_name}] → writes confluent.selected_envs
+  POST /marquez/{up,down} — docker compose up/down + patched UI dev server
+  POST /loadtest/{start,stop,teardown} — provision-demo-pipelines worker
+  POST /bridge/{start,stop} — `ol-confluent run` worker (provisions pending
+                              envs first, then spawns long-lived subprocess)
 """
 
 from __future__ import annotations

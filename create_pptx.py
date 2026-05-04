@@ -295,7 +295,7 @@ def s05_sources(prs):
     )
     sw5 = Inches(2.15); sy = Inches(4.42)
     stat_box(s, "7",    "Lineage Sources",        Inches(0.4),              sy, sw5)
-    stat_box(s, "215",  "Tests Passing",          Inches(0.4) + sw5 + Inches(0.17),      sy, sw5)
+    stat_box(s, "229",  "Tests Passing",          Inches(0.4) + sw5 + Inches(0.17),      sy, sw5)
     stat_box(s, "0",    "Credentials for Tests",  Inches(0.4) + (sw5+Inches(0.17))*2,   sy, sw5)
     stat_box(s, "10k+", "Topics Supported",       Inches(0.4) + (sw5+Inches(0.17))*3,   sy, sw5)
 

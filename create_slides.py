@@ -407,7 +407,7 @@ def build_slides():
     SW = (W - emu(1.4)) / 4
     SY = emu(12.2)
     stat_box("s1", "7",    "Lineage Sources",           emu(0.7),               SY, SW - emu(0.2))
-    stat_box("s2", "215",  "Tests Passing",             emu(0.7) + SW,          SY, SW - emu(0.2))
+    stat_box("s2", "229",  "Tests Passing",             emu(0.7) + SW,          SY, SW - emu(0.2))
     stat_box("s3", "0",    "Credentials for Tests",     emu(0.7) + SW * 2,      SY, SW - emu(0.2))
     stat_box("s4", "10k+", "Topics Supported",          emu(0.7) + SW * 3,      SY, SW - emu(0.2))
 

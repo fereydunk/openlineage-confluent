@@ -293,7 +293,7 @@ State is persisted in SQLite so removal detection works across process restarts.
 ## Development
 
 ```bash
-make test        # 215 tests, all offline — no credentials required
+make test        # 229 tests, all offline — no credentials required
 make lint        # ruff
 make type-check  # mypy
 ```
