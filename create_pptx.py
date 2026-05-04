@@ -270,30 +270,32 @@ def s04_architecture(prs):
          "All RunEvents emitted concurrently via a thread pool — scales to 10 000+ topics without blocking.",
          Inches(0.4) + cw4 + Inches(0.2), t4, cw4, ch4, TEAL)
     card(s, "Scheduled Pipeline",
-         "APScheduler drives periodic polling. run-once for snapshots, run for continuous operation.",
+         "Sleep-loop pacing: waits poll_interval_seconds AFTER each cycle finishes — no overlap. run-once for snapshots, run for continuous operation.",
          Inches(0.4) + (cw4 + Inches(0.2)) * 2, t4, cw4, ch4, NAVY)
 
 
 def s05_sources(prs):
     s = new_slide(prs)
     add_rect(s, 0, 0, SW, SH, LTGRAY)
-    slide_header(s, "Five Lineage Sources",
+    slide_header(s, "Seven Lineage Sources",
                  "Complete coverage of every Confluent component that moves data")
     simple_table(s,
         ["Source", "API Used", "What It Captures", "Job Type"],
         [
             ["Managed Connect",      "api.confluent.cloud/connect/v1",          "All managed source & sink connectors in Confluent Cloud",            "SOURCE / SINK_CONNECTOR"],
-            ["Flink SQL",            "Flink REST API + SQL parser",             "Persistent statements; input/output topics parsed from SQL",          "QUERY"],
+            ["Flink SQL",            "confluent flink statement list -o json",  "Persistent statements; input/output topics parsed from SQL",          "QUERY"],
             ["Consumer Groups",      "Metrics API consumer_lag_offsets",        "Any client committing offsets — the only cloud-plane signal",          "CONSUMER_GROUP"],
+            ["Kafka Producers",      "Metrics API received_bytes by client_id", "Per-producer client identity + topics produced",                       "PRODUCER"],
             ["ksqlDB",               "ksqlDB REST POST /ksql",                  "Persistent CREATE STREAM / TABLE queries and their topic wiring",      "QUERY"],
             ["Self-Managed Connect", "GET {endpoint}/connectors?expand=info,…", "On-prem / self-hosted Connect clusters alongside cloud topology",      "SOURCE / SINK_CONNECTOR"],
+            ["Tableflow",            "confluent tableflow topic list -o json",  "Active Tableflow syncs → Iceberg/Glue (closes the lake-house loop)",   "TABLE_SYNC"],
         ],
         [1.9, 2.45, 3.5, 1.75],
         top=Inches(1.85),
     )
     sw5 = Inches(2.15); sy = Inches(4.42)
-    stat_box(s, "5",    "Lineage Sources",        Inches(0.4),              sy, sw5)
-    stat_box(s, "146",  "Tests Passing",          Inches(0.4) + sw5 + Inches(0.17),      sy, sw5)
+    stat_box(s, "7",    "Lineage Sources",        Inches(0.4),              sy, sw5)
+    stat_box(s, "215",  "Tests Passing",          Inches(0.4) + sw5 + Inches(0.17),      sy, sw5)
     stat_box(s, "0",    "Credentials for Tests",  Inches(0.4) + (sw5+Inches(0.17))*2,   sy, sw5)
     stat_box(s, "10k+", "Topics Supported",       Inches(0.4) + (sw5+Inches(0.17))*3,   sy, sw5)
 

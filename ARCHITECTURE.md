@@ -13,13 +13,13 @@ Confluent exposes an Atlas-compatible catalog at `api.confluent.cloud/catalog/v1
 - Entity GUIDs are non-stable (they change between API calls)
 - The catalog is designed for schema metadata (Avro/Protobuf), not operational lineage
 
-**Conclusion:** The Stream Catalog API does not expose the graph that drives the Confluent Stream Lineage UI. Investigation scripts are preserved in `scripts/diagnose_*.py`.
+**Conclusion:** The Stream Catalog API does not expose the graph that drives the Confluent Stream Lineage UI.
 
 ---
 
-## Actual approach: five lineage sources
+## Actual approach: seven lineage sources
 
-Lineage is reconstructed from five authoritative sources, all fetched concurrently:
+Lineage is reconstructed from seven authoritative sources, all fetched concurrently per env (then merged across envs):
 
 ### 1. Managed Connect REST API
 
@@ -65,13 +65,29 @@ The `consumer_lag_offsets` metric is the only cloud-plane signal that exposes `c
 - Self-managed Connect workers (`connect-<name>` groups)
 - Any other component using the Kafka consumer group protocol
 
-**Important limitation:** There is no `client_id` dimension on any broker-side metric. Producer identity cannot be inferred from the Metrics API alone — the broker aggregates by topic/partition/group, not by producer client ID.
-
 **Internal group filtering:** Groups with the `_` prefix (`_confluent-*`, `_ksql-*`, `_schemas`) and `confluent_cli_consumer_*` prefix are excluded. These are internal Confluent infrastructure groups already represented by their dedicated lineage sources.
 
 **Pagination:** The Metrics API returns up to 1,000 rows per request. The bridge follows `meta.pagination.page_token` until exhausted.
 
-### 4. ksqlDB REST API
+### 4. Confluent Metrics API — producer lineage
+
+Same Metrics API endpoint as consumer lineage, but querying `received_bytes` grouped by `client_id` and `topic`:
+
+```
+POST https://api.telemetry.confluent.cloud/v2/metrics/cloud/query
+{
+  "aggregations": [{"metric": "io.confluent.kafka.server/received_bytes", "agg": "SUM"}],
+  "filter": {"field": "resource.kafka.id", "op": "EQ", "value": "<cluster_id>"},
+  "group_by": ["metric.topic", "metric.client_id"],
+  ...
+}
+```
+
+`metric.client_id` IS a valid groupBy dimension on `received_bytes` and `received_records` (an earlier limitation in this doc; the API gained it). This gives per-producer identity tied to the topics they actually wrote to in the lookback window.
+
+**Internal producer filtering:** client IDs starting with `connector-producer-` (managed Connect internal), `connector-` (self-managed Connect internal), or `_confluent-flink_` (Confluent Cloud Flink internal) are excluded — those flows are already captured by the Connect / Flink sources.
+
+### 5. ksqlDB REST API
 
 Three statements are executed against each configured ksqlDB cluster:
 
@@ -87,15 +103,31 @@ The `SHOW QUERIES EXTENDED` response includes `sinkKafkaTopics` (actual Kafka to
 
 Only RUNNING persistent queries with both resolved source and sink topics are emitted.
 
-### 5. Self-managed Kafka Connect REST API
+### 6. Self-managed Kafka Connect REST API
 
 ```
 GET {endpoint}/connectors?expand=info,status
 ```
 
-Auth: optional HTTP Basic. Available since Kafka Connect 2.3 (KIP-449). For older clusters that return 404 on `?expand`, the bridge falls back to individual `GET /connectors/{name}` and `GET /connectors/{name}/status` calls.
+Auth: optional HTTP Basic. Available since Kafka Connect 2.3 (KIP-449). For older clusters that return 404 on `?expand`, the bridge falls back to individual `GET /connectors/{name}` and `GET /connectors/{name}/status` calls. Per-connector failures inside that fallback set `last_ok = False` so the emitter quarantines the cluster's namespace (no false ABORTs from partial reads).
 
 Each configured self-managed cluster has a unique `name` label used as the namespace: `kafka-connect://<name>`.
+
+### 7. Tableflow via CLI
+
+The Tableflow REST API requires a bearer token Cloud API keys can't mint (same restriction as the Flink REST API). The bridge shells out to:
+
+```bash
+confluent tableflow topic list --environment {env} --cluster {cluster} -o json
+```
+
+Each active Tableflow topic becomes a `TABLE_SYNC` job with the source Kafka topic as input and an Iceberg/Glue dataset as output:
+
+- **Job**: `tableflow://<env_id>` / `<topic_name>`
+- **Input**: `kafka://<bootstrap>` / `<topic_name>`
+- **Output**: `glue://<region>` / `<glue_db>.<table_name>` (when `CONFLUENT_TABLEFLOW_GLUE_REGION` + `_GLUE_DB` are configured)
+
+This closes the lake-house lineage loop: the Spark/Trino reader using OpenLineage's Spark integration will write to the same `glue://<region>/<db>.<table>` Dataset namespace, stitching streaming → table → query lineage in Marquez.
 
 ---
 
@@ -172,11 +204,14 @@ Each configured self-managed cluster has a unique `name` label used as the names
 | Confluent entity | OL type | Namespace | Name |
 |---|---|---|---|
 | Kafka topic | `Dataset` | `kafka://<bootstrap>` | `<topic-name>` |
+| Iceberg table (Tableflow) | `Dataset` | `glue://<region>` | `<glue_db>.<table-name>` |
 | Managed source/sink connector | `Job` | `kafka-connect://<env_id>` | `<connector-name>` |
 | Self-managed connector | `Job` | `kafka-connect://<cluster_label>` | `<connector-name>` |
 | Flink statement | `Job` | `flink://<env_id>` | `<statement-name>` |
 | Consumer group | `Job` | `kafka-consumer-group://<cluster_id>` | `<group_id>` |
+| Kafka producer | `Job` | `kafka-producer://<cluster_id>` | `<client_id>` |
 | ksqlDB persistent query | `Job` | `ksqldb://<ksql_cluster_id>` | `<query_id>` |
+| Tableflow sync | `Job` | `tableflow://<env_id>` | `<topic-name>` |
 
 ### Event structure
 
@@ -200,9 +235,11 @@ The mapper filters on `source_type`/`target_type`. Only `"kafka_topic"` typed en
 | `kafka_connect_sink` | `kafka_topic` | `external` | topic(s) | none |
 | `flink_statement` | `kafka_topic` | `kafka_topic` | topic(s) | topic(s) |
 | `kafka_consumer_group` | `kafka_topic` | `consumer_group` | topic(s) | none |
+| `kafka_producer` | `external` | `kafka_topic` | none | topic(s) |
 | `ksqldb_query` | `kafka_topic` | `kafka_topic` | topic(s) | topic(s) |
+| `tableflow_topic_sync` | `kafka_topic` | `iceberg_table` | topic | iceberg dataset |
 
-Consumer groups are represented as Jobs with inputs (the topics they subscribe to) and no outputs — exactly how Marquez visualises a pure consumer.
+Consumer groups are represented as Jobs with inputs (the topics they subscribe to) and no outputs — exactly how Marquez visualises a pure consumer. Producers are the dual: outputs only, no inputs (the producer "writes" to topics).
 
 ### Diff tracking
 
@@ -231,16 +268,45 @@ for key in removed_keys:
 
 Removal detection works correctly across process restarts because `_known_jobs` is loaded from the SQLite state database at startup.
 
+### Quarantine via `failed_namespaces`
+
+A naive removal-detection has a serious failure mode: when a fetch returns 401 (auth blip), 5xx (CC outage), or times out, the affected source returns `[]`, the merged graph "loses" all those resources, and the diff-tracker fires ABORTs for every job that was in the previous graph from that source — wiping lineage in Marquez even though the resources are still there.
+
+The fix: every source client (Connect / Flink / Metrics consumers / Metrics producers / Tableflow / ksqlDB / self-managed Connect) tracks a `last_ok` (or per-method `*_ok`) flag. When false, `_EnvLineageClient.build_graph()` adds the corresponding OL job-namespace prefix to `LineageGraph.failed_namespaces`. The emitter's `emit_batch(events, failed_namespaces=...)` then **suppresses removal-detection** for any known job whose namespace is in that set, AND keeps the job in `_known_jobs` so the next successful poll either re-emits it normally or finally removes it:
+
+```python
+removed_keys = []
+quarantined  = 0
+for k, (ns, _) in self._known_jobs.items():
+    if k in current_keys:    continue
+    if ns in failed_namespaces:
+        quarantined += 1     # leave in _known_jobs; skip ABORT
+        continue
+    removed_keys.append(k)
+```
+
+A transient 401 storm during a Confluent Cloud incident no longer wipes Marquez. Recovery is automatic on the next cycle that returns 200.
+
+## Hot-reload of `config.yaml`
+
+`LineagePipeline.run_forever()` is a simple sleep-loop on `threading.Event` (no APScheduler — dropped in favor of completion-to-start interval semantics). At the top of every cycle, `_maybe_reload_envs()` re-reads the config file from disk and rebuilds the underlying `ConfluentLineageClient` if the env signature changed.
+
+The signature is `frozenset(_env_signature(e) for e in cfg.environments)` where `_env_signature(env)` is a tuple of `env_id`, `cluster_id`, `kafka_bootstrap`, `flink_compute_pool`, `kafka_rest_endpoint`, Kafka API key + secret, and an SR sub-tuple. Any rotation of those triggers a rebuild.
+
+Crucially, the **emitter and StateStore are NOT rebuilt** — diff-tracking continuity survives the swap. YAML errors during reload are caught and logged; the bridge keeps polling on the previous config until the next cycle reads a parseable file. Net effect: clicking "Provision demo pipelines" or "Save selection" in the wizard updates `config.yaml`, and within ≤60s the running bridge picks it up — no Stop / Start needed.
+
 ---
 
 ## Production-scale design
 
 | Bottleneck | Solution |
 |---|---|
-| Sequential multi-source fetches | Concurrent `ThreadPoolExecutor` in `get_lineage_graph()` — all 5 sources run in parallel |
+| Sequential multi-source fetches | Per-env `ThreadPoolExecutor` in `_EnvLineageClient.build_graph()` — 6 sources run in parallel; per-env graphs then merged in another `ThreadPoolExecutor` across envs |
 | Single-threaded HTTP emission | Parallel `ThreadPoolExecutor(max_workers=N)` in `emit_batch()` |
 | JSON state file — full rewrite per cycle | SQLite WAL mode — single atomic transaction per cycle |
 | Lock held during HTTP calls | Lock-release pattern: lock → read fingerprint → **release** → HTTP → lock → write fingerprint |
+| False ABORTs from transient fetch failures | `failed_namespaces` quarantine — known jobs in failed namespaces stay in `_known_jobs` instead of being ABORT'd |
+| Config changes require Stop/Start | Hot-reload — `_maybe_reload_envs()` at top of every cycle rebuilds the lineage client only if env signature changed |
 
 ### SQLite StateStore
 
@@ -325,18 +391,18 @@ Key configuration notes:
 
 ## Known limitations
 
-- **Producer identity**: No `client_id` dimension exists on any Confluent Metrics API broker metric. Individual producers cannot be identified from the cloud plane. Options: instrument producers directly with the OpenLineage SDK, or infer from Schema Registry (schema registrant ≈ likely writer).
 - **Flink SQL parsing**: Regex-based, covers `INSERT INTO` and `CREATE TABLE AS SELECT`. Complex patterns (CTEs, lateral joins, subqueries) may not parse correctly.
-- **Flink auth**: Relies on the Confluent CLI being logged in. If the CLI session expires, `list_flink_statements()` returns an empty list and logs a warning — it does not crash.
+- **Flink auth**: Relies on the Confluent CLI being logged in. If the CLI session expires, `list_flink_statements()` returns an empty list, sets `last_ok = False`, and the emitter quarantines the env's `flink://` namespace — no false ABORTs, but no new statements get picked up until the CLI is re-authed.
 - **Consumer group lookback**: Groups not seen within `CONFLUENT_METRICS_LOOKBACK_MINUTES` (default 10) are treated as inactive and removed from the graph. Increase the lookback for bursty consumers.
-- **ksqlDB source resolution**: If `SHOW STREAMS/TABLES EXTENDED` fails (auth error, timeout), source stream names fall back to their ksqlDB names rather than Kafka topic names.
-- **External sources/sinks**: Connector source endpoints (e.g., datagen internal source) and sink endpoints (e.g., httpbin.org) are omitted from the OpenLineage graph — only Kafka topics become Datasets.
+- **ksqlDB source resolution**: If `SHOW STREAMS/TABLES EXTENDED` fails (auth error, timeout), `last_ok` flips to `False` and the cluster's namespace is quarantined; source stream names won't be resolved to topics until the next successful poll.
+- **External sources/sinks**: Connector source endpoints (e.g., datagen internal source) and sink endpoints (e.g., httpbin.org) are omitted from the OpenLineage graph — only Kafka topics and Iceberg tables become Datasets.
 - **Field-level lineage**: Schema-level lineage (column → column mappings) is not yet extracted.
+- **Stateless sweep filter is broad**: `provision_demo_pipelines.py --teardown` Phase 2 deletes anything in the env whose name starts with `ol-`. A user-owned `ol-prod-orders` topic in the same env would be caught by the sweep. The wizard's "Delete all demo pipelines" button uses a per-env scope; it can't cross env boundaries.
 
 ## Future work
 
 - Use Confluent CLI OAuth token to hit Flink REST directly (removes subprocess dependency)
 - Extract field-level lineage from Schema Registry AVRO schemas — add `SchemaDatasetFacet` to Dataset nodes
-- Producer lineage via Schema Registry subject registration (schema registrant ≈ writer)
 - Support DataHub and OpenMetadata as explicit backends with per-backend transport config
 - Audit Log consumer as an alternative lineage source (event-driven rather than poll-based) for very large clusters
+- More distinctive demo prefix (`ol-demo-`) so the stateless sweep can't accidentally catch user-owned `ol-*` resources

@@ -380,23 +380,25 @@ def build_slides():
          "All RunEvents are emitted concurrently via a thread pool — scales to 10 000+ topics without blocking.",
          emu(0.7) + CW4, TOP4, CW4 - emu(0.15), CH4, TEAL)
     card("cc", "Scheduled Pipeline",
-         "APScheduler drives periodic polling. Run ad-hoc with run-once or continuously with run.",
+         "Sleep-loop pacing: waits poll_interval_seconds AFTER each cycle finishes — no overlap. Run ad-hoc with run-once or continuously with run.",
          emu(0.7) + CW4 * 2, TOP4, CW4 - emu(0.15), CH4, GREEN)
 
-    # ── Slide 5: Five Sources ─────────────────────────────────────────────────
+    # ── Slide 5: Seven Sources ────────────────────────────────────────────────
     new_slide(bg=SLATE)
     add(rect(oid("accent"), 0, 0, W, emu(0.18), TEAL))
-    header_bar("Five Lineage Sources",
+    header_bar("Seven Lineage Sources",
                "Complete coverage of every Confluent component that moves data")
 
     table_slide(
         ["Source", "API Used", "What It Captures", "Job Type"],
         [
             ["Managed Connect", "api.confluent.cloud/connect/v1", "All managed source & sink connectors in Confluent Cloud", "SOURCE_CONNECTOR / SINK_CONNECTOR"],
-            ["Flink SQL", "Flink REST API + SQL parser", "Persistent Flink statements; input/output topics parsed from SQL", "QUERY"],
+            ["Flink SQL", "confluent flink statement list -o json", "Persistent Flink statements; input/output topics parsed from SQL", "QUERY"],
             ["Consumer Groups", "Metrics API consumer_lag_offsets", "Any client committing offsets — the only cloud-plane consumer signal", "CONSUMER_GROUP"],
+            ["Kafka Producers", "Metrics API received_bytes by client_id", "Per-producer client identity + topics produced", "PRODUCER"],
             ["ksqlDB", "ksqlDB REST POST /ksql", "Persistent CREATE STREAM / TABLE queries and their topic wiring", "QUERY"],
             ["Self-Managed Connect", "GET {endpoint}/connectors?expand=info,status", "On-prem / self-hosted Connect clusters alongside cloud topology", "SOURCE_CONNECTOR / SINK_CONNECTOR"],
+            ["Tableflow", "confluent tableflow topic list -o json", "Active Tableflow syncs → Iceberg/Glue (closes the lake-house loop)", "TABLE_SYNC"],
         ],
         [4.5, 5.5, 8.5, 6.0],
         top=3.3,
@@ -404,8 +406,8 @@ def build_slides():
 
     SW = (W - emu(1.4)) / 4
     SY = emu(12.2)
-    stat_box("s1", "5",    "Lineage Sources",           emu(0.7),               SY, SW - emu(0.2))
-    stat_box("s2", "146",  "Tests Passing",             emu(0.7) + SW,          SY, SW - emu(0.2))
+    stat_box("s1", "7",    "Lineage Sources",           emu(0.7),               SY, SW - emu(0.2))
+    stat_box("s2", "215",  "Tests Passing",             emu(0.7) + SW,          SY, SW - emu(0.2))
     stat_box("s3", "0",    "Credentials for Tests",     emu(0.7) + SW * 2,      SY, SW - emu(0.2))
     stat_box("s4", "10k+", "Topics Supported",          emu(0.7) + SW * 3,      SY, SW - emu(0.2))
 

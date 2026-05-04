@@ -1,94 +1,102 @@
 # openlineage-confluent — example configuration
 # Copy to config.yaml and fill in your values.
-# All scalar keys can also be set as environment variables (see names below).
-# List keys (ksql_clusters, self_managed_connect_clusters) are YAML-only.
+#
+# Recommended path: don't edit this file by hand — run `./startup.sh` to launch
+# the wizard at http://localhost:8892, sign in to Confluent Cloud, pick
+# environments, and click "Start OpenLineage". The wizard mints all per-env
+# API keys and writes the same shape shown below.
 
 confluent:
   # ── Required ──────────────────────────────────────────────────────────────────
-  # Cloud-level API key (api.confluent.cloud — NOT Schema Registry or Kafka scoped)
-  # Create under: Confluent Cloud → API Keys → Add key → Cloud resource management
+  # Cloud-level API key (api.confluent.cloud — NOT Schema Registry or Kafka scoped).
+  # The KEY MUST INHERIT MetricsViewer (org or env scope) AND CloudClusterAdmin
+  # (or env-level Connect access). Confluent API keys carry their owner's perms,
+  # so create the key as a service account or user that already has those roles.
+  # Without these, Connect / Metrics API calls return 401 and producer / consumer
+  # / managed Connect lineage silently drops out of the graph.
   CONFLUENT_CLOUD_API_KEY:    "XXXXXXXXXXXXXXXX"
   CONFLUENT_CLOUD_API_SECRET: "your-cloud-api-secret-here"
 
-  # Confluent Cloud environment and Kafka cluster IDs
-  # Found under: Confluent Cloud → Environments → <env> → Cluster settings
-  CONFLUENT_ENV_ID:     "env-xxxxxx"
-  CONFLUENT_CLUSTER_ID: "lkc-xxxxxx"
+  # ── Multi-env: one entry per Confluent Cloud environment to bridge ────────────
+  # Each entry carries env-scoped credentials; the bridge polls every entry in
+  # parallel and merges the resulting LineageGraphs.
+  environments:
+    - env_id:               "env-xxxxxx"             # Confluent Cloud → Environments
+      cluster_id:           "lkc-xxxxxx"             # Cluster settings
+      kafka_bootstrap:      "pkc-xxxxxx.<region>.aws.confluent.cloud:9092"
 
-  # Regional Flink REST endpoint (stored for future use; CLI is used today)
-  # Found under: Confluent Cloud → Flink → Compute pools → REST endpoint
+      # Optional — enables Kafka REST topic-metadata enrichment
+      # (partition count, replication factor, isInternal). Use a CLUSTER-SCOPED
+      # Kafka API key (NOT Cloud-level). Create under: Cluster → API Keys.
+      kafka_rest_endpoint:  "https://pkc-xxxxxx.<region>.aws.confluent.cloud:443"
+      kafka_api_key:        "KAFKAAPIKEY"
+      kafka_api_secret:     "kafka-api-secret"
+
+      # Optional — used by `provision_demo_pipelines.py` to create chained Flink
+      # statements. Find under: Confluent Cloud → Flink → Compute pools.
+      flink_compute_pool:   "lfcp-xxxxxx"
+
+      # Optional — when set, every topic Dataset carries a SchemaDatasetFacet
+      # (AVRO / JSON Schema / Protobuf). SR uses its own key scope; create
+      # under: Environment → Schema Registry → API Keys.
+      schema_registry:
+        endpoint:   "https://psrc-xxxxx.<region>.aws.confluent.cloud"
+        api_key:    "SRAPIKEY"
+        api_secret: "sr-api-secret"
+
+    # A second env in a different region — the bridge stamps every edge with
+    # its env's kafka_bootstrap so multi-region topic Datasets get the right
+    # namespace. Add as many entries as you need.
+    # - env_id:           "env-yyyyyy"
+    #   cluster_id:       "lkc-yyyyyy"
+    #   kafka_bootstrap:  "pkc-yyyyyy.eu-central-1.aws.confluent.cloud:9092"
+
+  # ── selected_envs: wizard-private (do NOT set by hand) ────────────────────────
+  # The wizard's "Save selection" writes [{env_id, env_name}, ...] here for envs
+  # the user has picked but that haven't been provisioned yet. On "Start
+  # OpenLineage" the bridge mints API keys for each pending env and moves the
+  # full entry into `environments:` above. Pydantic ignores this field.
+
+  # ── Regional Flink REST endpoint (stored for future direct-API access) ────────
   CONFLUENT_FLINK_REST_URL: "https://flink.<region>.aws.confluent.cloud"
 
-  # ── Metrics API (consumer group lineage) ──────────────────────────────────────
-  # Uses consumer_lag_offsets to discover which consumer groups read which topics.
-  # Covers: application consumers, Kafka Streams, self-managed Connect workers.
-  #
-  # Optional: if omitted, falls back to CONFLUENT_CLOUD_API_KEY.
-  # The key must have the MetricsViewer role (Environment or Org level).
-  # Grant under: Confluent Cloud → Access Control → Service Accounts → Roles.
-  #
+  # ── Tableflow → Iceberg/Glue (optional) ───────────────────────────────────────
+  # When set, Tableflow topic syncs become OL jobs with `glue://<region>` outputs
+  # — closes the lake-house lineage loop with a Spark/Trino reader using the
+  # OpenLineage Spark integration on the same Glue catalog.
+  # CONFLUENT_TABLEFLOW_GLUE_REGION: "us-west-2"
+  # CONFLUENT_TABLEFLOW_GLUE_DB:     "ol_lineage"
+
+  # ── Metrics API key (optional override) ───────────────────────────────────────
+  # If omitted, falls back to CONFLUENT_CLOUD_API_KEY above. The key must have
+  # the MetricsViewer role; OrganizationAdmin transitively includes it.
   # CONFLUENT_METRICS_API_KEY:    "YYYYYYYYYYYYYYYY"
   # CONFLUENT_METRICS_API_SECRET: "your-metrics-api-secret"
   #
-  # How far back to look (minutes). Default 10 covers one poll cycle + Metrics
-  # API ingestion lag (~2-3 min). Increase if poll_interval is longer than 10 min.
+  # How far back to look (minutes). Default 10 covers the 60s default poll
+  # interval + Metrics API ingestion lag (~2-3 min).
   # CONFLUENT_METRICS_LOOKBACK_MINUTES: 10
   #
   # Extra consumer group prefixes to exclude beyond the built-in filters
   # (built-in: "_" and "confluent_cli_consumer_"):
   # consumer_group_exclude_prefixes:
   #   - "legacy-internal-"
-  #   - "test-"
   #
-  # Extra producer client_id prefixes to exclude beyond the built-in filters.
-  # Built-in exclusions: "connector-producer-" and "connector-" (Connect internals).
+  # Extra producer client_id prefixes to exclude beyond the built-in filters
+  # (built-in: "connector-producer-", "connector-", "_confluent-flink_"):
   # producer_client_id_exclude_prefixes:
   #   - "test-producer-"
-  #   - "internal-tools-"
 
-  # ── Kafka REST API (optional) ─────────────────────────────────────────────────
-  # When configured, every topic Dataset carries a custom KafkaTopicDatasetFacet
-  # with partition count + replication factor + isInternal flag (mirrors what
-  # Confluent Stream Lineage shows on a topic node).
-  #
-  # Endpoint is the cluster-scoped REST endpoint shown under:
-  #   Confluent Cloud → Cluster → Cluster settings → REST endpoint
-  # Auth uses a Kafka API key (cluster-scoped, NOT a Cloud-level key).
-  # Create under: Confluent Cloud → Cluster → API Keys.
-  #
-  # CONFLUENT_KAFKA_REST_ENDPOINT: "https://lkc-xxxxxx.<region>.aws.confluent.cloud:443"
-  # CONFLUENT_KAFKA_API_KEY:       "KAFKAAPIKEY"
-  # CONFLUENT_KAFKA_API_SECRET:    "kafka-api-secret"
-
-  # ── Schema Registry (optional) ────────────────────────────────────────────────
-  # When configured, every topic Dataset in emitted RunEvents carries a
-  # SchemaDatasetFacet built from the latest key + value subjects. Fields are
-  # prefixed: "key.<field>" and "value.<field>". Supported schema types: AVRO,
-  # JSON Schema, Protobuf (proto stored as opaque field).
-  #
-  # Schema Registry uses its own API key scope — Cloud-level keys do NOT work.
-  # Generate under: Confluent Cloud → Environment → Schema Registry → API Keys.
-  #
-  # schema_registry:
-  #   endpoint:   "https://psrc-xxxxx.<region>.aws.confluent.cloud"
-  #   api_key:    "SRAPIKEY"
-  #   api_secret: "sr-api-secret"
-
-  # ── ksqlDB clusters (list, YAML-only) ─────────────────────────────────────────
-  # One entry per ksqlDB cluster to scan for persistent query lineage.
-  # Create a ksqlDB-scoped API key under: Confluent Cloud → ksqlDB → API Keys.
-  #
+  # ── ksqlDB clusters (top-level list, not per-env) ─────────────────────────────
+  # Each ksqlDB cluster has its own REST endpoint and API key scope.
   # ksql_clusters:
   #   - cluster_id:    "lksqlc-xxxxxx"
   #     rest_endpoint: "https://pksqlc-xxxxxx.<region>.aws.confluent.cloud"
   #     api_key:       "KSQLAPIKEY"
   #     api_secret:    "ksql-api-secret"
 
-  # ── Self-managed Connect clusters (list, YAML-only) ───────────────────────────
-  # One entry per self-managed Kafka Connect cluster to scrape.
+  # ── Self-managed Connect clusters (top-level list, not per-env) ───────────────
   # The "name" field is used as the namespace label: kafka-connect://<name>.
-  # Leave username/password out for unauthenticated clusters.
-  #
   # self_managed_connect_clusters:
   #   - name:          "on-prem-etl"
   #     rest_endpoint: "http://connect-host-1:8083"
@@ -109,14 +117,18 @@ openlineage:
   # Optional: API key if your backend requires auth
   # OPENLINEAGE_API_KEY: "your-backend-api-key"
 
-  # Kafka bootstrap — used as the namespace for all topic Datasets
-  # Found under: Confluent Cloud → Cluster → Cluster settings → Bootstrap servers
+  # Fallback Kafka bootstrap — used as the topic-Dataset namespace ONLY when an
+  # edge has no per-env bootstrap stamped on it. In multi-env setups, each env's
+  # `kafka_bootstrap` (above) takes precedence.
   OPENLINEAGE_KAFKA_BOOTSTRAP: "pkc-xxxxxx.<region>.aws.confluent.cloud:9092"
 
   OPENLINEAGE_PRODUCER: "openlineage-confluent/0.1.0"
 
 pipeline:
-  # How often to poll Confluent Cloud for lineage changes (seconds)
+  # How long to wait AFTER each cycle finishes before starting the next.
+  # Wall-clock interval is completion-to-start, so a slow cycle never triggers
+  # an overlapping run. The wait is interruptible — SIGTERM from the wizard's
+  # Stop button returns within milliseconds.
   PIPELINE_POLL_INTERVAL: 60
 
   # If true, re-emit all events every cycle even if lineage hasn't changed.
@@ -127,4 +139,5 @@ pipeline:
   PIPELINE_MAX_WORKERS: 8
 
   # SQLite database path for persisting known jobs across restarts.
+  # Diff-tracking and removal-detection survive process restarts.
   # PIPELINE_STATE_DB: "~/.openlineage-confluent/state.db"

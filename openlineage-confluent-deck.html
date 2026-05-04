@@ -501,7 +501,7 @@
         </div>
         <div class="card accent-green">
           <h3>Scheduled Pipeline</h3>
-          <p>APScheduler drives periodic polling. Run ad-hoc with <code>run-once</code> or continuously with <code>run</code>.</p>
+          <p>Sleep-loop pacing — waits <code>poll_interval_seconds</code> AFTER each cycle finishes, no overlap. Hot-reloads <code>config.yaml</code> at the top of every cycle so wizard-added envs are picked up without restart.</p>
         </div>
       </div>
     </div>
@@ -510,7 +510,7 @@
   <!-- ─────────────────────────────────────────────── SLIDE 5: 5 Sources -->
   <div class="slide" style="display:none">
     <div class="slide-header">
-      <h1>Five Lineage Sources</h1>
+      <h1>Seven Lineage Sources</h1>
       <p>Complete coverage of every Confluent component that moves data</p>
     </div>
     <div class="slide-body">
@@ -550,17 +550,29 @@
               <td><code>QUERY</code></td>
             </tr>
             <tr>
+              <td>Kafka Producers</td>
+              <td>Metrics API <code>received_bytes</code> grouped by <code>client_id</code></td>
+              <td>Per-producer client identity + topics produced (broker-side signal)</td>
+              <td><code>PRODUCER</code></td>
+            </tr>
+            <tr>
               <td>Self-Managed Connect</td>
               <td><code>GET {endpoint}/connectors?expand=info,status</code></td>
               <td>On-prem / self-hosted Connect clusters alongside cloud topology</td>
               <td><code>SOURCE_CONNECTOR</code> / <code>SINK_CONNECTOR</code></td>
             </tr>
+            <tr>
+              <td>Tableflow</td>
+              <td><code>confluent tableflow topic list -o json</code></td>
+              <td>Active Tableflow topic syncs → Iceberg/Glue tables (closes the lake-house loop)</td>
+              <td><code>TABLE_SYNC</code></td>
+            </tr>
           </tbody>
         </table>
       </div>
       <div class="stat-row">
-        <div class="stat"><div class="stat-num">5</div><div class="stat-lbl">Lineage Sources</div></div>
-        <div class="stat"><div class="stat-num">146</div><div class="stat-lbl">Tests Passing</div></div>
+        <div class="stat"><div class="stat-num">7</div><div class="stat-lbl">Lineage Sources</div></div>
+        <div class="stat"><div class="stat-num">215</div><div class="stat-lbl">Tests Passing</div></div>
         <div class="stat"><div class="stat-num">0</div><div class="stat-lbl">Credentials Required for Tests</div></div>
         <div class="stat"><div class="stat-num">10k+</div><div class="stat-lbl">Topics Supported</div></div>
       </div>
