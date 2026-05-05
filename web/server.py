@@ -1947,11 +1947,14 @@ async function ltStop() {
 }
 
 async function ltTeardown() {
-  const env  = document.getElementById('lt-env').value;
+  const sel  = document.getElementById('lt-env');
+  const env  = sel.value;
+  const envName = sel.options[sel.selectedIndex]?.text || env;
+  const envLabel = (envName && envName !== env) ? envName + ' (' + env + ')' : env;
   const stat = document.getElementById('lt-status');
   if (!env) { stat.innerHTML = '<span class="err">pick an environment first</span>'; return; }
   if (!confirm('Tear down all demo pipelines (Datagen + Flink + topics + ' +
-               'consumer groups) for env ' + env + ' in Confluent Cloud?\\n\\n' +
+               'consumer groups) for env ' + envLabel + ' in Confluent Cloud?\\n\\n' +
                'This cannot be undone.')) return;
   const btn = document.getElementById('lt-teardown-btn');
   btn.disabled = true;
