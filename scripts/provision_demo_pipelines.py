@@ -180,10 +180,11 @@ STAGE_NAMES = ("enrich", "filter", "project", "transform", "route", "score")
 
 @dataclass
 class Pipeline:
-    """One independent pipeline: connector → topics → flink stages → consumer?"""
+    """One independent pipeline: producer-or-connector → topics → flink → consumer."""
     domain: str
-    flink_stages: int       # 0 = Datagen-only (or Datagen + consumer)
+    flink_stages: int       # 0 = no Flink stages
     ends_with_consumer: bool
+    uses_native_producer: bool = False    # True → Java producer at head, False → Datagen connector
 
     # Filled in during generation; teardown reads them back from state.
     topics: list[str] = field(default_factory=list)
@@ -192,11 +193,12 @@ class Pipeline:
 
     @property
     def total_nodes(self) -> int:
-        """Boxes in the CC stream-lineage diagram: connector + topic +
-        (Flink + topic)*N + (consumer if any). 3, 5, 7, … for end-to-end
-        connected pipelines; 2, 4, 6, … for pipelines that dangle on the
-        last topic (only happens in tests / legacy callers — production
-        always sets ends_with_consumer=True)."""
+        """Boxes in the CC stream-lineage diagram: head (connector OR producer)
+        + topic + (Flink + topic)*N + (consumer if any). 3, 5, 7, … for end-to-end
+        connected pipelines; 2, 4, 6, … for pipelines that dangle on the last
+        topic (only happens in tests / legacy callers — production always sets
+        ends_with_consumer=True). Native producer counts as 1 head node, same
+        as the Datagen connector."""
         return 2 + 2 * self.flink_stages + (1 if self.ends_with_consumer else 0)
 
 
@@ -232,9 +234,15 @@ def generate_pipelines(num_pipelines: int, min_nodes: int, max_nodes: int,
         domain = f"{prefix}{i:02d}"
         flink_stages = rng.randint(min_flink_stages, max_flink_stages)
         ends_with_consumer = True   # always — required for end-to-end connectivity
+        # ~50/50 split: half the pipelines use a native Java Kafka producer
+        # at the head (exercises the bridge's Metrics API producer source),
+        # the other half use a Datagen managed connector (exercises the
+        # Connect API source). Variety in CC stream lineage out of the box.
+        uses_native_producer = rng.random() < 0.5
 
         pipe = Pipeline(domain=domain, flink_stages=flink_stages,
-                        ends_with_consumer=ends_with_consumer)
+                        ends_with_consumer=ends_with_consumer,
+                        uses_native_producer=uses_native_producer)
         # Topic 0 is Datagen output; one more topic per Flink stage.
         pipe.topics = [f"ol-{domain}-t0"] + [
             f"ol-{domain}-t{k+1}" for k in range(flink_stages)
@@ -472,6 +480,78 @@ def start_consumers(group_topic_pairs: list[tuple[str, str]]) -> list[int]:
     return pids
 
 
+# ─── Native Java producer ────────────────────────────────────────────────────
+
+JAVA_DEMO_DIR = PROJECT_ROOT / "scripts" / "java_client_demo"
+JAVA_DEMO_JAR = JAVA_DEMO_DIR / "target" / "openlineage-java-demo-1.0-SNAPSHOT.jar"
+JAVA_HOME_DEFAULT = "/opt/homebrew/opt/openjdk@21"
+
+
+def _ensure_java_jar() -> bool:
+    """Build the Java demo JAR if missing. Returns True on success."""
+    if JAVA_DEMO_JAR.exists():
+        return True
+    print(f"  Java demo JAR not found at {JAVA_DEMO_JAR}; running `make java-demo-build`…")
+    java_home = os.environ.get("JAVA_HOME", JAVA_HOME_DEFAULT)
+    r = subprocess.run(
+        ["make", "java-demo-build"],
+        cwd=str(PROJECT_ROOT),
+        env={**os.environ, "JAVA_HOME": java_home},
+        capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode != 0 or not JAVA_DEMO_JAR.exists():
+        print(f"  ✗ JAR build failed (rc={r.returncode}): {r.stderr.strip()[:300]}")
+        print(f"  Install JDK 21 + Maven, or run manually: make java-demo-build")
+        return False
+    print(f"  ✓ Built {JAVA_DEMO_JAR.name}")
+    return True
+
+
+def start_native_producers(producer_specs: list[dict]) -> list[int]:
+    """Spawn one Java OrderProducer per spec.
+
+    Each spec: {domain, topic, client_id, job_namespace, job_name}.
+    Producers run in infinite mode at MESSAGE_INTERVAL_MS=2000 (1 msg/2s) so
+    they don't burn API quota; SIGTERM on teardown emits a COMPLETE event
+    via the JVM shutdown hook before exiting.
+    """
+    if not producer_specs:
+        return []
+    if not _ensure_java_jar():
+        print("  ⚠ skipping native Java producers (no JAR)")
+        return []
+
+    java_home = os.environ.get("JAVA_HOME", JAVA_HOME_DEFAULT)
+    java_bin = f"{java_home}/bin/java"
+    if not Path(java_bin).exists():
+        java_bin = "java"   # let PATH resolve it; will fail loudly if missing
+
+    pids: list[int] = []
+    for spec in producer_specs:
+        env = {
+            **os.environ,
+            "JAVA_HOME":              java_home,
+            "KAFKA_BOOTSTRAP_SERVERS": KAFKA_BOOTSTRAP,
+            "KAFKA_API_KEY":          KAFKA_API_KEY,
+            "KAFKA_API_SECRET":       KAFKA_API_SECRET,
+            "OL_TOPIC":               spec["topic"],
+            "OL_JOB_NAMESPACE":       spec["job_namespace"],
+            "OL_JOB_NAME":            spec["job_name"],
+            "KAFKA_CLIENT_ID":        spec["client_id"],
+            "MESSAGE_COUNT":          "-1",     # infinite
+            "MESSAGE_INTERVAL_MS":    "2000",   # 1 msg / 2s
+            # Marquez URL — leave default unless overridden
+            "MARQUEZ_URL":            os.environ.get("MARQUEZ_URL", "http://localhost:5000"),
+        }
+        proc = subprocess.Popen(
+            [java_bin, "-cp", str(JAVA_DEMO_JAR), "demo.OrderProducer"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pids.append(proc.pid)
+        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} (pid={proc.pid})")
+    return pids
+
+
 # ─── Provision ───────────────────────────────────────────────────────────────
 
 def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | None) -> None:
@@ -479,10 +559,12 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     rng = random.Random(seed)
 
     range_str = f"exactly {min_nodes}" if min_nodes == max_nodes else f"random length in [{min_nodes}, {max_nodes}]"
+    n_datagen  = sum(1 for p in pipelines if not p.uses_native_producer)
+    n_producer = sum(1 for p in pipelines if p.uses_native_producer)
     summary_line = (
         f"Generated {len(pipelines)} pipeline(s), {range_str} nodes each — "
         f"total nodes={sum(p.total_nodes for p in pipelines)} "
-        f"(connectors={len(pipelines)}, "
+        f"(datagen-headed={n_datagen}, native-producer-headed={n_producer}, "
         f"flink={sum(p.flink_stages for p in pipelines)}, "
         f"consumers={sum(1 for p in pipelines if p.ends_with_consumer)})"
     )
@@ -493,18 +575,19 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     connectors: dict = state.setdefault("connectors", {})
     statements: list = state.setdefault("flink_statements", [])
 
-    print("\n══ Step 1/6 — Create Kafka topics ══")
+    print("\n══ Step 1/7 — Create Kafka topics ══")
     for p in pipelines:
         for t in p.topics:
             create_topic(t, topics)
     save_state(state)
 
-    print("\n══ Step 2/6 — Register schemas for every topic in each chain ══")
+    print("\n══ Step 2/7 — Register schemas for every topic in each chain ══")
     if not (SR_ENDPOINT and SR_KEY and SR_SECRET):
         print("  (skipped — env has no Schema Registry credentials in config.yaml)")
     else:
         for p in pipelines:
-            # Datagen output topic — RAW_ORDERS_SCHEMA matches the ORDERS quickstart
+            # Head topic — RAW_ORDERS_SCHEMA matches both the ORDERS quickstart
+            # (Datagen) and the Java OrderProducer's payload shape.
             sr_register(p.topics[0], RAW_ORDERS_SCHEMA)
             # First Flink output (if any) gets ENRICHED_SCHEMA; later Flink
             # stages SELECT * so the schema propagates without re-registration,
@@ -513,20 +596,26 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
             for k, topic in enumerate(p.topics[1:], start=1):
                 sr_register(topic, ENRICHED_SCHEMA)
 
-    print("\n══ Step 3/6 — Create Datagen connectors (one per pipeline) ══")
-    for p in pipelines:
+    print("\n══ Step 3/7 — Create Datagen connectors (Datagen-headed pipelines) ══")
+    datagen_pipes = [p for p in pipelines if not p.uses_native_producer]
+    if not datagen_pipes:
+        print("  (none — all pipelines use native producers)")
+    for p in datagen_pipes:
         if p.domain not in connectors:
             conn_id = create_connector(p.domain, p.topics[0])
             if conn_id:
                 connectors[p.domain] = conn_id
     save_state(state)
 
-    print("\n══ Step 4/6 — Waiting 90s for Datagen to register raw AVRO schemas ══")
-    for remaining in range(90, 0, -15):
-        print(f"  {remaining}s ...", flush=True)
-        time.sleep(15)
+    print("\n══ Step 4/7 — Waiting 90s for Datagen to register raw AVRO schemas ══")
+    if not datagen_pipes:
+        print("  (skipped — no Datagen connectors to wait on)")
+    else:
+        for remaining in range(90, 0, -15):
+            print(f"  {remaining}s ...", flush=True)
+            time.sleep(15)
 
-    print("\n══ Step 5/6 — Create chained Flink statements ══")
+    print("\n══ Step 5/7 — Create chained Flink statements ══")
     for p in pipelines:
         for k, name in enumerate(p.flink_names):
             if name in statements:
@@ -538,7 +627,23 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
                 statements.append(name)
     save_state(state)
 
-    print("\n══ Step 6/6 — Start consumer groups ══")
+    print("\n══ Step 6/7 — Start native Java producers (native-producer-headed pipelines) ══")
+    producer_pipes = [p for p in pipelines if p.uses_native_producer]
+    producer_specs = [{
+        "domain":         p.domain,
+        "topic":          p.topics[0],
+        "client_id":      f"ol-{p.domain}-producer",
+        "job_namespace":  f"kafka-producer://{CLUSTER_ID}",
+        "job_name":       f"ol-{p.domain}-producer",
+    } for p in producer_pipes]
+    if not producer_specs:
+        print("  (none — all pipelines use Datagen)")
+    producer_pids = start_native_producers(producer_specs)
+    if producer_pids:
+        state["producer_pids"] = producer_pids
+        save_state(state)
+
+    print("\n══ Step 7/7 — Start consumer groups ══")
     pairs = [
         (p.consumer_group, p.topics[-1])
         for p in pipelines
@@ -550,11 +655,12 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
 
     print(f"""
 ══ Provisioning complete ══
-  Pipelines       : {len(pipelines)}
-  Topics          : {len(topics)}
-  Connectors      : {len(connectors)}/{len(pipelines)}
-  Flink statements: {len(statements)}/{sum(p.flink_stages for p in pipelines)}
-  Consumer pids   : {len(pids)}/{sum(1 for p in pipelines if p.ends_with_consumer)}
+  Pipelines           : {len(pipelines)}
+  Topics              : {len(topics)}
+  Datagen connectors  : {len(connectors)}/{n_datagen}
+  Native producers    : {len(producer_pids)}/{n_producer}
+  Flink statements    : {len(statements)}/{sum(p.flink_stages for p in pipelines)}
+  Consumer pids       : {len(pids)}/{sum(1 for p in pipelines if p.ends_with_consumer)}
 
 The bridge will pick these up on its next poll cycle (≤60s) — no restart needed.
 """)
@@ -666,16 +772,24 @@ def teardown() -> None:
     """
     state = load_state()
 
-    print("\n══ Stopping consumer processes ══")
+    print("\n══ Stopping local client processes ══")
     if PIDS_FILE.exists():
         for line in PIDS_FILE.read_text().splitlines():
             try:
                 os.kill(int(line.strip()), 15)
-                print(f"  killed pid {line.strip()}")
+                print(f"  killed consumer pid {line.strip()}")
             except (ProcessLookupError, ValueError, OSError):
                 pass
         PIDS_FILE.unlink(missing_ok=True)
     WORKER_SCRIPT.unlink(missing_ok=True)
+    # Native Java producers spawned by the provisioner (state["producer_pids"])
+    # SIGTERM lets the JVM shutdown hook flush a COMPLETE OL event before exit.
+    for pid in state.get("producer_pids", []):
+        try:
+            os.kill(int(pid), 15)
+            print(f"  killed Java producer pid {pid}")
+        except (ProcessLookupError, ValueError, OSError):
+            pass
 
     # ── Phase 1: state-tracked cleanup ──────────────────────────────────────
     print("\n══ Phase 1/2 — State-tracked cleanup ══")

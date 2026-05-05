@@ -57,6 +57,29 @@ def test_exact_n_when_min_equals_max(script_module):
             f"min=max={n} should give exact-{n} pipelines, got {[p.total_nodes for p in pipes]}"
 
 
+def test_pipelines_mix_datagen_and_native_producers(script_module):
+    """Across a realistic run we should see both head types, roughly 50/50.
+    Exercises both the bridge's Connect API source (Datagen) and Metrics API
+    producer source (native producer) in one demo."""
+    pipes = script_module.generate_pipelines(
+        num_pipelines=50, min_nodes=3, max_nodes=5, seed=11,
+    )
+    n_datagen  = sum(1 for p in pipes if not p.uses_native_producer)
+    n_producer = sum(1 for p in pipes if p.uses_native_producer)
+    assert n_datagen  > 0, "expected some Datagen-headed pipelines"
+    assert n_producer > 0, "expected some native-producer-headed pipelines"
+    # Loose bound: each side at least 25% of the fleet (50/50 ± slack).
+    assert n_datagen  >= len(pipes) // 4
+    assert n_producer >= len(pipes) // 4
+
+
+def test_uses_native_producer_is_deterministic_with_seed(script_module):
+    """Same seed → same producer/connector assignment per pipeline."""
+    a = script_module.generate_pipelines(num_pipelines=20, min_nodes=3, max_nodes=7, seed=99)
+    b = script_module.generate_pipelines(num_pipelines=20, min_nodes=3, max_nodes=7, seed=99)
+    assert [p.uses_native_producer for p in a] == [p.uses_native_producer for p in b]
+
+
 def test_seed_makes_output_deterministic(script_module):
     a = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=6, seed=42)
     b = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=6, seed=42)

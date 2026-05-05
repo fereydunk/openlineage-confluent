@@ -15,7 +15,7 @@ import java.util.Properties;
 import java.util.UUID;
 
 /**
- * Produces order messages to ol-raw-orders and emits OpenLineage START/COMPLETE
+ * Produces order messages to a Kafka topic and emits OpenLineage START/COMPLETE
  * events directly to Marquez — the only way to capture Kafka producer identity,
  * since the Confluent Metrics API exposes no client_id dimension for producers.
  *
@@ -25,22 +25,28 @@ import java.util.UUID;
  *   KAFKA_API_SECRET
  *
  * Optional:
- *   MARQUEZ_URL     default http://localhost:5000
- *   OL_TOPIC        default ol-raw-orders
- *   MESSAGE_COUNT   default 100
+ *   MARQUEZ_URL          default http://localhost:5000
+ *   OL_TOPIC             default ol-raw-orders
+ *   OL_JOB_NAMESPACE     default kafka-producer://order-service
+ *   OL_JOB_NAME          default order-producer
+ *   KAFKA_CLIENT_ID      default ol-java-order-producer
+ *   MESSAGE_COUNT        default 100   (use -1 for infinite — long-running demo)
+ *   MESSAGE_INTERVAL_MS  default 0     (sleep between sends; 1000 = 1 msg/s)
  */
 public class OrderProducer {
 
-    private static final String JOB_NAMESPACE = "kafka-producer://order-service";
-    private static final String JOB_NAME      = "order-producer";
-
     public static void main(String[] args) throws Exception {
-        String bootstrap    = requireEnv("KAFKA_BOOTSTRAP_SERVERS");
-        String apiKey       = requireEnv("KAFKA_API_KEY");
-        String apiSecret    = requireEnv("KAFKA_API_SECRET");
-        String marquezUrl   = env("MARQUEZ_URL", "http://localhost:5000");
-        String topic        = env("OL_TOPIC", "ol-raw-orders");
-        int    messageCount = Integer.parseInt(env("MESSAGE_COUNT", "100"));
+        String bootstrap     = requireEnv("KAFKA_BOOTSTRAP_SERVERS");
+        String apiKey        = requireEnv("KAFKA_API_KEY");
+        String apiSecret     = requireEnv("KAFKA_API_SECRET");
+        String marquezUrl    = env("MARQUEZ_URL", "http://localhost:5000");
+        String topic         = env("OL_TOPIC", "ol-raw-orders");
+        String jobNamespace  = env("OL_JOB_NAMESPACE", "kafka-producer://order-service");
+        String jobName       = env("OL_JOB_NAME", "order-producer");
+        String clientId      = env("KAFKA_CLIENT_ID", "ol-java-order-producer");
+        int    messageCount  = Integer.parseInt(env("MESSAGE_COUNT", "100"));
+        long   intervalMs    = Long.parseLong(env("MESSAGE_INTERVAL_MS", "0"));
+        boolean infinite     = (messageCount < 0);
 
         String datasetNamespace = "kafka://" + bootstrap;
 
@@ -68,8 +74,8 @@ public class OrderProducer {
                         .build())
                 .build();
         OpenLineage.Job job = ol.newJobBuilder()
-                .namespace(JOB_NAMESPACE)
-                .name(JOB_NAME)
+                .namespace(jobNamespace)
+                .name(jobName)
                 .facets(jobFacets)
                 .build();
 
@@ -82,14 +88,14 @@ public class OrderProducer {
                 .outputs(outputs)
                 .build());
         System.out.printf("[OL] START emitted  runId=%s  job=%s/%s%n",
-                runId, JOB_NAMESPACE, JOB_NAME);
+                runId, jobNamespace, jobName);
 
         // ── Kafka producer ────────────────────────────────────────────────────
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        props.put(ProducerConfig.CLIENT_ID_CONFIG, "ol-java-order-producer");
+        props.put(ProducerConfig.CLIENT_ID_CONFIG, clientId);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put("security.protocol", "SASL_SSL");
         props.put("sasl.mechanism", "PLAIN");
@@ -97,33 +103,57 @@ public class OrderProducer {
                 "org.apache.kafka.common.security.plain.PlainLoginModule required " +
                 "username=\"" + apiKey + "\" password=\"" + apiSecret + "\";");
 
+        // Emit COMPLETE on JVM shutdown so long-running producers (MESSAGE_COUNT=-1)
+        // still flush a terminal lineage event when SIGTERM'd by the wizard teardown.
+        UUID finalRunId = runId;
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                olClient.emit(ol.newRunEventBuilder()
+                        .eventTime(ZonedDateTime.now())
+                        .eventType(OpenLineage.RunEvent.EventType.COMPLETE)
+                        .job(job)
+                        .run(ol.newRunBuilder().runId(finalRunId).build())
+                        .outputs(outputs)
+                        .build());
+                System.out.println("[OL] COMPLETE emitted (shutdown)");
+            } catch (Exception ignored) { /* nothing useful to do at shutdown */ }
+        }));
+
+        long produced = 0;
         try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
-            for (int i = 0; i < messageCount; i++) {
+            while (infinite || produced < messageCount) {
                 String orderId = "java-order-" + UUID.randomUUID().toString().substring(0, 8);
                 String value = String.format(
                         "{\"order_id\":\"%s\",\"customer_id\":\"cust-%d\"," +
-                        "\"amount\":%.2f,\"status\":\"PENDING\",\"source\":\"java-producer\"}",
-                        orderId, i % 200, 9.99 + (i * 4.17));
+                        "\"amount\":%.2f,\"status\":\"PENDING\",\"source\":\"%s\"}",
+                        orderId, (int)(produced % 200), 9.99 + (produced * 4.17), clientId);
                 producer.send(new ProducerRecord<>(topic, orderId, value)).get();
-                if ((i + 1) % 20 == 0)
-                    System.out.printf("Produced %d/%d messages%n", i + 1, messageCount);
+                produced++;
+                if (produced % 20 == 0) {
+                    System.out.printf("Produced %d%s messages%n",
+                            produced, infinite ? "" : "/" + messageCount);
+                }
+                if (intervalMs > 0) Thread.sleep(intervalMs);
             }
         }
-        System.out.printf("Done. Produced %d messages → %s%n", messageCount, topic);
+        System.out.printf("Done. Produced %d messages → %s%n", produced, topic);
 
-        // Emit COMPLETE
-        olClient.emit(ol.newRunEventBuilder()
-                .eventTime(ZonedDateTime.now())
-                .eventType(OpenLineage.RunEvent.EventType.COMPLETE)
-                .job(job)
-                .run(ol.newRunBuilder().runId(runId).build())
-                .outputs(outputs)
-                .build());
-        System.out.println("[OL] COMPLETE emitted");
+        // For finite runs, emit COMPLETE here (the shutdown hook is a backstop
+        // for SIGTERM during infinite runs).
+        if (!infinite) {
+            olClient.emit(ol.newRunEventBuilder()
+                    .eventTime(ZonedDateTime.now())
+                    .eventType(OpenLineage.RunEvent.EventType.COMPLETE)
+                    .job(job)
+                    .run(ol.newRunBuilder().runId(runId).build())
+                    .outputs(outputs)
+                    .build());
+            System.out.println("[OL] COMPLETE emitted");
+        }
         System.out.println();
         System.out.println("Check Marquez UI → http://localhost:3000");
-        System.out.println("  namespace : " + JOB_NAMESPACE);
-        System.out.println("  job       : " + JOB_NAME);
+        System.out.println("  namespace : " + jobNamespace);
+        System.out.println("  job       : " + jobName);
         System.out.println("  output    : " + datasetNamespace + "/" + topic);
     }
 
