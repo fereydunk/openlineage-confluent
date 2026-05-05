@@ -752,7 +752,7 @@ PROVISION_SCRIPT = REPO_DIR / "scripts" / "provision_demo_pipelines.py"
 
 # Wizard input bounds — clamped server-side regardless of what the browser sends.
 _LT_MIN_PIPELINES = 1
-_LT_MAX_PIPELINES = 50
+_LT_MAX_PIPELINES = 500
 _LT_MIN_NODES     = 2
 _LT_MAX_NODES     = 20
 
@@ -1721,7 +1721,7 @@ PAGE = """<!doctype html>
       </div>
       <div class="field-pair">
         <label>Number of pipelines</label>
-        <input id="lt-num-pipelines" type="number" min="1" max="50" value="5"
+        <input id="lt-num-pipelines" type="number" min="1" max="500" value="5"
                style="width:100%; background:#0d1117; border:1px solid #30363d;
                       border-radius:4px; color:#c9d1d9; padding:.45rem .6rem;
                       font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
