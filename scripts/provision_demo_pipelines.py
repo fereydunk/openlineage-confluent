@@ -679,16 +679,41 @@ def _is_demo_name(name: str) -> bool:
     return name.startswith(DEMO_NAME_PREFIX)
 
 
+_FLINK_POOL_REGION_CACHE: tuple[str, str] | None = None
+
+
 def _flink_region_args() -> list[str]:
     """Cloud/region flags required by `confluent flink statement` commands.
 
-    Returns ["--cloud", FLINK_CLOUD, "--region", FLINK_REGION] when both are
-    known, else []. Without these flags the CLI errors with "no cloud provider
-    and region selected" unless the user has set a context with `confluent
-    flink region use`.
+    The pool's region wins over the cluster's region — they're usually the
+    same, but if a misaligned pool exists (e.g. wizard previously created the
+    pool in us-west-2 against a us-east-2 cluster), Flink statements live
+    where the POOL is, so list/delete must query the pool's region. Falls back
+    to the cluster region (parsed from kafka_bootstrap) if the pool describe
+    fails — last-resort better than nothing.
     """
-    if FLINK_CLOUD and FLINK_REGION:
-        return ["--cloud", FLINK_CLOUD, "--region", FLINK_REGION]
+    global _FLINK_POOL_REGION_CACHE
+    if _FLINK_POOL_REGION_CACHE is None:
+        cloud, region = "", ""
+        if FLINK_POOL:
+            r = subprocess.run(
+                ["confluent", "flink", "compute-pool", "describe", FLINK_POOL,
+                 "--environment", ENV_ID, "-o", "json"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                try:
+                    data = json.loads(r.stdout)
+                    cloud  = (data.get("cloud")  or "").lower()
+                    region = (data.get("region") or "").lower()
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+        if not (cloud and region):
+            cloud, region = FLINK_CLOUD, FLINK_REGION    # fall back to cluster region
+        _FLINK_POOL_REGION_CACHE = (cloud, region)
+    cloud, region = _FLINK_POOL_REGION_CACHE
+    if cloud and region:
+        return ["--cloud", cloud, "--region", region]
     return []
 
 

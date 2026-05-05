@@ -702,6 +702,22 @@ _DEFAULT_KAFKA_TYPE  = "basic"
 _DEFAULT_FLINK_CFU   = "10"
 
 
+def _parse_cloud_region_from_bootstrap(bootstrap: str) -> tuple[str, str]:
+    """Extract (cloud, region) from a Confluent Cloud Kafka bootstrap host.
+
+    Bootstrap shape: pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
+    e.g. pkc-921jm.us-east-2.aws.confluent.cloud:9092 → ("aws", "us-east-2")
+
+    Returns ("", "") when the bootstrap doesn't match the expected shape; the
+    caller should fall back to _DEFAULT_CLOUD / _DEFAULT_REGION in that case.
+    """
+    host = (bootstrap or "").split(":", 1)[0]
+    parts = host.split(".")
+    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
+        return parts[-3], parts[-4]
+    return "", ""
+
+
 def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
     """Ensure env_id has Kafka cluster + SR + Flink pool; create what's missing.
 
@@ -849,18 +865,43 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
         emit("⚠ SR not available in env (skipping)")
 
     # ── 3. Flink compute pool ───────────────────────────────────────────────
+    # Flink can only reference Kafka topics in the SAME cloud+region as the
+    # pool — a us-west-2 pool reading a us-east-2 cluster always errors with
+    # "Table does not exist". Derive the cluster's region from the bootstrap
+    # host and pin the Flink pool to it; reject pools in any other region as
+    # unusable.
+    target_cloud, target_region = _parse_cloud_region_from_bootstrap(bootstrap)
+    if not target_region:
+        target_cloud, target_region = _DEFAULT_CLOUD, _DEFAULT_REGION
+        emit(f"⚠ Couldn't parse region from bootstrap '{bootstrap}'; "
+             f"falling back to {target_cloud}/{target_region}")
+
     pools, err = _list_flink_pools(env_id)
-    if pools:
-        pool_id = pools[0].get("id", "")
-        emit(f"✓ Reusing existing Flink compute pool {pool_id}")
+    aligned = [p for p in pools
+               if (p.get("region") or "").lower() == target_region
+               and (p.get("cloud") or "").lower() == target_cloud]
+    misaligned = [p for p in pools if p not in aligned]
+    if aligned:
+        pool_id = aligned[0].get("id", "")
+        emit(f"✓ Reusing existing Flink compute pool {pool_id} ({target_cloud}/{target_region})")
+        if misaligned:
+            misnames = ", ".join(f"{p['id']} ({p.get('cloud','?')}/{p.get('region','?')})"
+                                 for p in misaligned)
+            emit(f"  ⚠ Ignoring {len(misaligned)} misaligned pool(s) in other regions: {misnames}")
     else:
-        pname = f"openlineage-{env_id[-6:]}"
+        if misaligned:
+            misnames = ", ".join(f"{p['id']} ({p.get('cloud','?')}/{p.get('region','?')})"
+                                 for p in misaligned)
+            emit(f"  ⚠ {len(misaligned)} existing pool(s) in wrong region "
+                 f"(can't read this cluster's topics): {misnames}")
+            emit(f"  Creating a new pool in {target_cloud}/{target_region} instead.")
+        pname = f"openlineage-{env_id[-6:]}-{target_region}"
         emit(f"… Creating Flink compute pool '{pname}' "
-             f"({_DEFAULT_CLOUD}/{_DEFAULT_REGION}, max {_DEFAULT_FLINK_CFU} CFU)")
+             f"({target_cloud}/{target_region}, max {_DEFAULT_FLINK_CFU} CFU)")
         ok, data, err = _run_confluent_json(
             ["flink", "compute-pool", "create", pname,
-             "--cloud",   _DEFAULT_CLOUD,
-             "--region",  _DEFAULT_REGION,
+             "--cloud",   target_cloud,
+             "--region",  target_region,
              "--max-cfu", _DEFAULT_FLINK_CFU,
              "--environment", env_id,
              "-o", "json"],
