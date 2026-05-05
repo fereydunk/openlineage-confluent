@@ -51,3 +51,6 @@ scripts/demo_20_state*.json
 scripts/demo_20_consumers*.pids
 scripts/demo_20_consumer_worker.py
 scripts/demo_pipelines_consumer_worker.py
+
+# Per-process stderr/stdout from spawned Java + Python workers
+scripts/logs/

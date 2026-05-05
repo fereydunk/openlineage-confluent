@@ -148,8 +148,16 @@ DOMAIN_PREFIXES = (
 
 # First Flink stage projects + enriches; downstream stages identity-transform
 # so the topic schema is preserved without registering one per stage.
+#
+# Why the explicit (col1, col2, ...) target list on every INSERT: when reading
+# or writing a Kafka topic, Flink always exposes an implicit `key BYTES`
+# column unless you configure `key.format`. Without listing target columns,
+# Flink expects 1 + N values and our SELECT only produces N → the statement
+# fails SQL validation with "Different number of columns". Listing the
+# value columns explicitly tells Flink "leave the key alone".
 ENRICH_SQL_TEMPLATE = """\
 INSERT INTO `{out}`
+  (ordertime, orderid, itemid, orderunits, city, state, zipcode, risk_tier)
 SELECT
   ordertime,
   orderid,
@@ -166,12 +174,14 @@ SELECT
 FROM `{in_}`;
 """
 
-# Identity transforms used for stages 2+ — schema-preserving SELECT * with
+# Identity transforms used for stages 2+ — schema-preserving copy with
 # rotating WHERE clauses so each stage is at least syntactically distinct.
+# Same `key BYTES` issue as above: explicit value-only column list.
+_ENRICHED_COLS = "ordertime, orderid, itemid, orderunits, city, state, zipcode, risk_tier"
 IDENTITY_SQL_VARIANTS = (
-    "INSERT INTO `{out}` SELECT * FROM `{in_}`;",
-    "INSERT INTO `{out}` SELECT * FROM `{in_}` WHERE orderunits >= 0;",
-    "INSERT INTO `{out}` SELECT * FROM `{in_}` WHERE risk_tier <> 'NONE';",
+    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}`;",
+    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}` WHERE orderunits >= 0;",
+    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}` WHERE risk_tier <> 'NONE';",
 )
 
 # Stage-name suffixes for visual variety in Marquez (purely cosmetic).
@@ -409,14 +419,33 @@ def create_connector(domain: str, output_topic: str) -> str | None:
 
 
 def create_flink_statement(name: str, sql: str) -> bool:
+    """Create + wait for a Flink statement to reach RUNNING.
+
+    Two non-obvious flags:
+      --database CLUSTER_ID  Tells Flink which Kafka cluster's topics to
+        resolve unqualified table names against. Without it, the statement
+        is created but immediately FAILS SQL validation with "Table … does
+        not exist" because the default database is empty.
+      --wait                 Block until the statement is RUNNING (success)
+        or FAILED (real error). Without --wait, the create call returns
+        rc=0 the moment the statement is queued — even if it later fails —
+        and we'd report ✓ for broken statements.
+    """
     try:
         r = run(["confluent", "flink", "statement", "create", name,
                  "--sql", sql,
-                 "--compute-pool", FLINK_POOL, "--environment", ENV_ID])
+                 "--compute-pool", FLINK_POOL,
+                 "--database",     CLUSTER_ID,
+                 "--environment",  ENV_ID,
+                 "--wait"])
         if ok(r):
             print(f"  flink ✓ {name}")
             return True
-        print(f"  flink ✗ {name}: {r.stderr.strip()[:120]}")
+        # Trim noisy boilerplate; the useful bit is usually after "Caused by"
+        err = (r.stderr or r.stdout or "").strip()
+        if "Caused by:" in err:
+            err = err.split("Caused by:", 1)[1].strip().split("\n", 1)[0]
+        print(f"  flink ✗ {name}: {err[:200]}")
         return False
     except Exception as e:
         print(f"  flink exception {name}: {e}")
@@ -470,13 +499,19 @@ def start_consumers(group_topic_pairs: list[tuple[str, str]]) -> list[int]:
            "KAFKA_BOOTSTRAP": KAFKA_BOOTSTRAP,
            "KAFKA_API_KEY": KAFKA_API_KEY,
            "KAFKA_API_SECRET": KAFKA_API_SECRET}
+    log_dir = SCRIPT_DIR / "logs"
+    log_dir.mkdir(exist_ok=True)
     for group, topic in group_topic_pairs:
+        # Redirect stderr to a per-consumer log so silent crashes leave a trace.
+        # Append mode so restarts don't clobber prior output.
+        log_path = log_dir / f"consumer-{group}.log"
+        log_fh = open(log_path, "ab")
         proc = subprocess.Popen(
             [sys.executable, str(WORKER_SCRIPT), topic, group],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env, stdout=log_fh, stderr=subprocess.STDOUT,
         )
         pids.append(proc.pid)
-        print(f"  consumer ✓ {group} → {topic} (pid={proc.pid})")
+        print(f"  consumer ✓ {group} → {topic} (pid={proc.pid}, log={log_path.name})")
     return pids
 
 
@@ -526,7 +561,16 @@ def start_native_producers(producer_specs: list[dict]) -> list[int]:
     if not Path(java_bin).exists():
         java_bin = "java"   # let PATH resolve it; will fail loudly if missing
 
+    if not (SR_ENDPOINT and SR_KEY and SR_SECRET):
+        print("  ⚠ skipping native Java producers — env has no Schema Registry "
+              "credentials in config.yaml. Producers need SR to write Avro records "
+              "compatible with the pre-registered topic schema (otherwise downstream "
+              "Flink can't deserialize). Re-provision via the wizard to mint SR keys.")
+        return []
+
     pids: list[int] = []
+    log_dir = SCRIPT_DIR / "logs"
+    log_dir.mkdir(exist_ok=True)
     for spec in producer_specs:
         env = {
             **os.environ,
@@ -534,6 +578,12 @@ def start_native_producers(producer_specs: list[dict]) -> list[int]:
             "KAFKA_BOOTSTRAP_SERVERS": KAFKA_BOOTSTRAP,
             "KAFKA_API_KEY":          KAFKA_API_KEY,
             "KAFKA_API_SECRET":       KAFKA_API_SECRET,
+            # Schema Registry — required by KafkaAvroSerializer so the producer
+            # writes records that match the AVRO schema we pre-registered for
+            # this topic. Plain string values would fail Flink deserialization.
+            "SR_URL":                 SR_ENDPOINT,
+            "SR_API_KEY":             SR_KEY,
+            "SR_API_SECRET":          SR_SECRET,
             "OL_TOPIC":               spec["topic"],
             "OL_JOB_NAMESPACE":       spec["job_namespace"],
             "OL_JOB_NAME":            spec["job_name"],
@@ -543,12 +593,16 @@ def start_native_producers(producer_specs: list[dict]) -> list[int]:
             # Marquez URL — leave default unless overridden
             "MARQUEZ_URL":            os.environ.get("MARQUEZ_URL", "http://localhost:5000"),
         }
+        # Redirect stdout+stderr to a per-producer log so silent JVM crashes
+        # leave a trace. Append mode preserves prior runs' output.
+        log_path = log_dir / f"producer-{spec['client_id']}.log"
+        log_fh = open(log_path, "ab")
         proc = subprocess.Popen(
             [java_bin, "-cp", str(JAVA_DEMO_JAR), "demo.OrderProducer"],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env, stdout=log_fh, stderr=subprocess.STDOUT,
         )
         pids.append(proc.pid)
-        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} (pid={proc.pid})")
+        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} (pid={proc.pid}, log={log_path.name})")
     return pids
 
 

@@ -165,13 +165,20 @@ def test_first_flink_stage_is_enrich(script_module):
     assert "FROM `in_topic`" in sql
 
 
-def test_later_flink_stages_use_select_star(script_module):
-    """Stage 1+ uses identity SELECT * variants — schema-preserving."""
+def test_later_flink_stages_preserve_enriched_schema(script_module):
+    """Stage 1+ uses identity-shape SELECT — schema-preserving copy of every
+    value column (NOT SELECT *, which would also pull in Flink's implicit
+    BYTES key column and break INSERT)."""
     import random
     rng = random.Random(0)
     sqls = [script_module._flink_sql(k, "i", "o", rng) for k in range(1, 6)]
     for sql in sqls:
-        assert "SELECT *" in sql
+        # Each value column must appear in both the target list and the SELECT
+        for col in ("ordertime", "orderid", "itemid", "orderunits",
+                    "city", "state", "zipcode", "risk_tier"):
+            assert col in sql, f"missing column {col!r} in SQL: {sql}"
+        # Schema-preserving = no projection that drops columns
+        assert "SELECT *" not in sql, f"identity stage must list columns explicitly, not SELECT *: {sql}"
 
 
 def test_flink_names_distinct_within_pipeline(script_module):
