@@ -200,7 +200,8 @@ class Pipeline:
         return 2 + 2 * self.flink_stages + (1 if self.ends_with_consumer else 0)
 
 
-def generate_pipelines(num_pipelines: int, max_nodes: int, *, seed: int | None = None) -> list[Pipeline]:
+def generate_pipelines(num_pipelines: int, min_nodes: int, max_nodes: int,
+                       *, seed: int | None = None) -> list[Pipeline]:
     """Build `num_pipelines` Pipeline definitions, all fully connected end-to-end.
 
     A "node" is a box you'd see in Confluent Cloud's stream lineage diagram —
@@ -213,20 +214,23 @@ def generate_pipelines(num_pipelines: int, max_nodes: int, *, seed: int | None =
         connector → topic → Flink → topic → Flink → topic → cg  (7, 2 stages)
         …                                                       (3 + 2N nodes)
 
-    So pipelines always have an odd node count. `max_nodes` caps the diagram
-    width; we round it down to the largest fitting odd value and then pick
-    a random length in [3, max_odd_nodes].
+    Pipelines always have an odd node count. min_nodes/max_nodes are clamped
+    to >=3 and rounded down to the nearest odd value; the per-pipeline length
+    is then a uniform pick from {min, min+2, …, max}. Set min == max for
+    exact-N pipelines.
 
     `seed` makes the generator deterministic — used by tests.
     """
     rng = random.Random(seed)
-    max_nodes = max(3, max_nodes)
-    max_flink_stages = max(0, (max_nodes - 3) // 2)
+    min_nodes = max(3, min_nodes)
+    max_nodes = max(min_nodes, max_nodes)
+    min_flink_stages = (min_nodes - 3) // 2
+    max_flink_stages = (max_nodes - 3) // 2
     out: list[Pipeline] = []
     for i in range(num_pipelines):
         prefix = DOMAIN_PREFIXES[i % len(DOMAIN_PREFIXES)]
         domain = f"{prefix}{i:02d}"
-        flink_stages = rng.randint(0, max_flink_stages)
+        flink_stages = rng.randint(min_flink_stages, max_flink_stages)
         ends_with_consumer = True   # always — required for end-to-end connectivity
 
         pipe = Pipeline(domain=domain, flink_stages=flink_stages,
@@ -470,12 +474,13 @@ def start_consumers(group_topic_pairs: list[tuple[str, str]]) -> list[int]:
 
 # ─── Provision ───────────────────────────────────────────────────────────────
 
-def provision(num_pipelines: int, max_nodes: int, seed: int | None) -> None:
-    pipelines = generate_pipelines(num_pipelines, max_nodes, seed=seed)
+def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | None) -> None:
+    pipelines = generate_pipelines(num_pipelines, min_nodes, max_nodes, seed=seed)
     rng = random.Random(seed)
 
+    range_str = f"exactly {min_nodes}" if min_nodes == max_nodes else f"random length in [{min_nodes}, {max_nodes}]"
     summary_line = (
-        f"Generated {len(pipelines)} pipeline(s) with random length in [2, {max_nodes}] — "
+        f"Generated {len(pipelines)} pipeline(s), {range_str} nodes each — "
         f"total nodes={sum(p.total_nodes for p in pipelines)} "
         f"(connectors={len(pipelines)}, "
         f"flink={sum(p.flink_stages for p in pipelines)}, "
@@ -794,9 +799,12 @@ def main() -> None:
                         help="Path to config.yaml (default: project root config.yaml)")
     parser.add_argument("--num-pipelines", type=int, default=10,
                         help="Number of independent pipelines to generate (default: 10)")
-    parser.add_argument("--max-nodes", type=int, default=4,
-                        help="Maximum nodes per pipeline (jobs only — Datagen + Flinks + consumer). "
-                             "Actual length is randomised in [2, max-nodes]. Default: 4.")
+    parser.add_argument("--min-nodes", type=int, default=3,
+                        help="Minimum nodes per pipeline (boxes in CC stream lineage: "
+                             "connector + topic + Flinks/topics + consumer). Min 3. Default: 3.")
+    parser.add_argument("--max-nodes", type=int, default=5,
+                        help="Maximum nodes per pipeline. Set min == max for exact-N pipelines. "
+                             "Even values round down to the nearest odd. Default: 5.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for the random pipeline generator (omit for fresh randomness).")
     grp = parser.add_mutually_exclusive_group(required=True)
@@ -808,7 +816,7 @@ def main() -> None:
     _load_env_creds(Path(args.config), args.env)
 
     if args.provision:
-        provision(args.num_pipelines, args.max_nodes, args.seed)
+        provision(args.num_pipelines, args.min_nodes, args.max_nodes, args.seed)
     elif args.teardown:
         teardown()
     else:

@@ -913,7 +913,8 @@ def _lt_emit(line: str) -> None:
         _lt_state["lines"].append(line)
 
 
-def _lt_provision_worker(env_id: str, num_pipelines: int, max_nodes: int) -> None:
+def _lt_provision_worker(env_id: str, num_pipelines: int,
+                         min_nodes: int, max_nodes: int) -> None:
     """Worker thread: ensure resources exist, then run the provision script."""
     rc_final = 1
     try:
@@ -924,11 +925,13 @@ def _lt_provision_worker(env_id: str, num_pipelines: int, max_nodes: int) -> Non
             return
 
         _lt_emit("")
-        _lt_emit(f"=== Provisioning {num_pipelines} pipeline(s) (max {max_nodes} nodes each) "
+        range_str = f"exactly {min_nodes}" if min_nodes == max_nodes else f"{min_nodes}–{max_nodes}"
+        _lt_emit(f"=== Provisioning {num_pipelines} pipeline(s) ({range_str} nodes each) "
                  f"via {PROVISION_SCRIPT.name} ===")
         argv = [sys.executable, str(PROVISION_SCRIPT),
                 "--env", env_id, "--config", str(CONFIG_YML),
                 "--num-pipelines", str(num_pipelines),
+                "--min-nodes",     str(min_nodes),
                 "--max-nodes",     str(max_nodes),
                 "--provision"]
         proc = subprocess.Popen(
@@ -960,13 +963,15 @@ def _lt_start_provision(
     mode: str = "provision",
     *,
     num_pipelines: int = 10,
-    max_nodes: int = 4,
+    min_nodes: int = 3,
+    max_nodes: int = 5,
 ) -> tuple[bool, str]:
     """Launch provision flow (with auto resource creation) or teardown for env_id.
 
     `provision` runs _lt_provision_worker (creates cluster/SR/Flink if missing,
     then runs the provision script). `teardown` just runs the script directly.
-    num_pipelines and max_nodes are clamped to the wizard input bounds.
+    num_pipelines, min_nodes, max_nodes are clamped to the wizard input bounds.
+    Set min_nodes == max_nodes for exact-N pipelines.
     """
     if not PROVISION_SCRIPT.exists():
         return False, f"{PROVISION_SCRIPT} not found"
@@ -976,7 +981,10 @@ def _lt_start_provision(
         return False, "mode must be 'provision' or 'teardown'"
 
     num_pipelines = max(_LT_MIN_PIPELINES, min(_LT_MAX_PIPELINES, num_pipelines))
+    min_nodes     = max(_LT_MIN_NODES,     min(_LT_MAX_NODES,     min_nodes))
     max_nodes     = max(_LT_MIN_NODES,     min(_LT_MAX_NODES,     max_nodes))
+    if min_nodes > max_nodes:
+        min_nodes = max_nodes    # allow user to type out-of-order without erroring
 
     if mode == "provision":
         # Atomic check-and-claim: prevents two simultaneous /loadtest/start POSTs
@@ -999,11 +1007,12 @@ def _lt_start_provision(
             })
         threading.Thread(
             target=_lt_provision_worker,
-            args=(env_id, num_pipelines, max_nodes),
+            args=(env_id, num_pipelines, min_nodes, max_nodes),
             daemon=True,
         ).start()
+        range_str = f"exactly {min_nodes}" if min_nodes == max_nodes else f"{min_nodes}–{max_nodes}"
         return True, (f"provisioning started for {env_id} — "
-                      f"{num_pipelines} pipeline(s), max {max_nodes} nodes each")
+                      f"{num_pipelines} pipeline(s), {range_str} nodes each")
 
     # Teardown: env must already be configured with Kafka creds
     configured = {e["env_id"]: e for e in _configured_env_ids()}
@@ -1573,6 +1582,13 @@ PAGE = """<!doctype html>
                       font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
       </div>
       <div class="field-pair">
+        <label>Min nodes per pipeline</label>
+        <input id="lt-min-nodes" type="number" min="3" max="21" value="5"
+               style="width:100%; background:#0d1117; border:1px solid #30363d;
+                      border-radius:4px; color:#c9d1d9; padding:.45rem .6rem;
+                      font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
+      </div>
+      <div class="field-pair">
         <label>Max nodes per pipeline</label>
         <input id="lt-max-nodes" type="number" min="3" max="21" value="5"
                style="width:100%; background:#0d1117; border:1px solid #30363d;
@@ -1584,8 +1600,9 @@ PAGE = """<!doctype html>
       Every pipeline is fully connected end-to-end:
       <code>Datagen → topic → [Flink → topic]* → consumer-group</code>.
       A node = any box in CC's stream lineage diagram (connector, topic, Flink, consumer).
-      So odd counts only — 3 nodes = no Flink, 5 nodes = 1 Flink stage,
-      7 = 2 stages, etc. Max nodes is rounded down to the largest fitting odd value.
+      Odd counts only — 3 nodes = no Flink, 5 = 1 Flink stage, 7 = 2 stages, etc.
+      Each pipeline's length is a uniform random pick from {min, min+2, …, max};
+      <strong>set min = max for exact-N pipelines.</strong>
       Each Flink stage uses one CFU — keep <em>num × Flinks-per-pipeline</em>
       within your compute pool's CFU budget (default 10).
     </div>
@@ -1956,14 +1973,16 @@ async function populateLoadTestEnvs() {
 async function ltStart() {
   const env  = document.getElementById('lt-env').value;
   const num  = parseInt(document.getElementById('lt-num-pipelines').value, 10) || 5;
-  const max  = parseInt(document.getElementById('lt-max-nodes').value, 10) || 4;
+  const min  = parseInt(document.getElementById('lt-min-nodes').value, 10) || 5;
+  const max  = parseInt(document.getElementById('lt-max-nodes').value, 10) || 5;
   const stat = document.getElementById('lt-status');
   if (!env) {
     stat.innerHTML = '<span class="err">pick a target environment first</span>';
     return;
   }
   document.getElementById('lt-start-btn').disabled = true;
-  stat.innerHTML = '<span class="dim">provisioning ' + num + ' pipeline(s), max ' + max +
+  const rangeStr = (min === max) ? ('exactly ' + min) : (min + '–' + max);
+  stat.innerHTML = '<span class="dim">provisioning ' + num + ' pipeline(s), ' + rangeStr +
                    ' nodes each…</span>';
   document.getElementById('lt-log').classList.remove('hidden');
   document.getElementById('lt-log').textContent = '';
@@ -1971,7 +1990,7 @@ async function ltStart() {
     const r = await fetch('/loadtest/start', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({env_id: env, num_pipelines: num, max_nodes: max}),
+      body: JSON.stringify({env_id: env, num_pipelines: num, min_nodes: min, max_nodes: max}),
     });
     const d = await r.json();
     if (!r.ok) {
@@ -2283,13 +2302,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 num_pipelines = int(data.get("num_pipelines", 10))
-                max_nodes     = int(data.get("max_nodes",     4))
+                # Default min == max so legacy callers (and the wizard if the
+                # min input is left blank) get exact-N behavior.
+                max_nodes     = int(data.get("max_nodes",     5))
+                min_nodes     = int(data.get("min_nodes",     max_nodes))
             except (TypeError, ValueError):
-                self._send_json(400, {"error": "num_pipelines and max_nodes must be integers"})
+                self._send_json(400, {"error":
+                    "num_pipelines, min_nodes, max_nodes must be integers"})
                 return
             ok, msg = _lt_start_provision(
                 env_id, mode="provision",
-                num_pipelines=num_pipelines, max_nodes=max_nodes,
+                num_pipelines=num_pipelines,
+                min_nodes=min_nodes, max_nodes=max_nodes,
             )
             if not ok:
                 self._send_json(409 if "running" in msg else 400, {"error": msg})

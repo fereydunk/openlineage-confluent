@@ -29,12 +29,12 @@ def script_module():
 
 
 def test_generates_requested_count(script_module):
-    pipes = script_module.generate_pipelines(num_pipelines=7, max_nodes=5, seed=1)
+    pipes = script_module.generate_pipelines(num_pipelines=7, min_nodes=3, max_nodes=5, seed=1)
     assert len(pipes) == 7
 
 
 def test_lengths_within_bounds(script_module):
-    pipes = script_module.generate_pipelines(num_pipelines=50, max_nodes=8, seed=1)
+    pipes = script_module.generate_pipelines(num_pipelines=50, min_nodes=3, max_nodes=8, seed=1)
     for p in pipes:
         assert 2 <= p.total_nodes <= 8, p
 
@@ -42,21 +42,31 @@ def test_lengths_within_bounds(script_module):
 def test_max_nodes_clamped_to_minimum_3(script_module):
     """Even if caller passes max_nodes=1, generator clamps to 3 (the
     smallest end-to-end-connected pipeline: connector + topic + consumer)."""
-    pipes = script_module.generate_pipelines(num_pipelines=5, max_nodes=1, seed=1)
+    pipes = script_module.generate_pipelines(num_pipelines=5, min_nodes=3, max_nodes=1, seed=1)
     for p in pipes:
         assert p.total_nodes == 3
 
 
+def test_exact_n_when_min_equals_max(script_module):
+    """min_nodes == max_nodes must always produce that exact size."""
+    for n in (3, 5, 7, 9, 11):
+        pipes = script_module.generate_pipelines(
+            num_pipelines=20, min_nodes=n, max_nodes=n, seed=42,
+        )
+        assert all(p.total_nodes == n for p in pipes), \
+            f"min=max={n} should give exact-{n} pipelines, got {[p.total_nodes for p in pipes]}"
+
+
 def test_seed_makes_output_deterministic(script_module):
-    a = script_module.generate_pipelines(num_pipelines=10, max_nodes=6, seed=42)
-    b = script_module.generate_pipelines(num_pipelines=10, max_nodes=6, seed=42)
+    a = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=6, seed=42)
+    b = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=6, seed=42)
     assert [(p.domain, p.flink_stages, p.ends_with_consumer) for p in a] == \
            [(p.domain, p.flink_stages, p.ends_with_consumer) for p in b]
 
 
 def test_different_seeds_produce_different_output(script_module):
-    a = script_module.generate_pipelines(num_pipelines=20, max_nodes=8, seed=1)
-    b = script_module.generate_pipelines(num_pipelines=20, max_nodes=8, seed=2)
+    a = script_module.generate_pipelines(num_pipelines=20, min_nodes=3, max_nodes=8, seed=1)
+    b = script_module.generate_pipelines(num_pipelines=20, min_nodes=3, max_nodes=8, seed=2)
     a_shape = [(p.flink_stages, p.ends_with_consumer) for p in a]
     b_shape = [(p.flink_stages, p.ends_with_consumer) for p in b]
     assert a_shape != b_shape
@@ -64,20 +74,20 @@ def test_different_seeds_produce_different_output(script_module):
 
 def test_domain_names_are_unique(script_module):
     """Even when the prefix repeats (more than DOMAIN_PREFIXES count), names differ."""
-    pipes = script_module.generate_pipelines(num_pipelines=40, max_nodes=4, seed=1)
+    pipes = script_module.generate_pipelines(num_pipelines=40, min_nodes=3, max_nodes=4, seed=1)
     names = [p.domain for p in pipes]
     assert len(set(names)) == len(names)
 
 
 def test_topics_count_matches_flink_stages(script_module):
     """Number of topics = 1 (Datagen output) + flink_stages (one output per stage)."""
-    pipes = script_module.generate_pipelines(num_pipelines=15, max_nodes=6, seed=7)
+    pipes = script_module.generate_pipelines(num_pipelines=15, min_nodes=3, max_nodes=6, seed=7)
     for p in pipes:
         assert len(p.topics) == 1 + p.flink_stages
 
 
 def test_consumer_group_set_iff_ends_with_consumer(script_module):
-    pipes = script_module.generate_pipelines(num_pipelines=30, max_nodes=6, seed=3)
+    pipes = script_module.generate_pipelines(num_pipelines=30, min_nodes=3, max_nodes=6, seed=3)
     for p in pipes:
         if p.ends_with_consumer:
             assert p.consumer_group is not None
@@ -90,7 +100,7 @@ def test_variety_appears_in_a_realistic_run(script_module):
     """Across 30 pipelines: every one ends with a consumer (full end-to-end
     connectivity is required), and we should see a spread of chain lengths."""
     # max_nodes=8 → max_flink_stages=(8-3)//2=2 → possible totals: 3, 5, 7
-    pipes = script_module.generate_pipelines(num_pipelines=30, max_nodes=8, seed=11)
+    pipes = script_module.generate_pipelines(num_pipelines=30, min_nodes=3, max_nodes=8, seed=11)
     consumer_endings = sum(1 for p in pipes if p.ends_with_consumer)
     distinct_lengths = {p.total_nodes for p in pipes}
     assert consumer_endings == len(pipes), "every pipeline must end with a consumer"
@@ -119,6 +129,6 @@ def test_later_flink_stages_use_select_star(script_module):
 
 
 def test_flink_names_distinct_within_pipeline(script_module):
-    pipes = script_module.generate_pipelines(num_pipelines=10, max_nodes=10, seed=99)
+    pipes = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=10, seed=99)
     for p in pipes:
         assert len(set(p.flink_names)) == len(p.flink_names), p
