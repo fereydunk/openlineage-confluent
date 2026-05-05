@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from openlineage.client.event_v2 import (
@@ -29,12 +29,15 @@ from openlineage.client.event_v2 import (
     RunEvent,
     RunState,
 )
-from openlineage.client.facet_v2 import documentation_job, job_type_job, ownership_job, schema_dataset
+from openlineage.client.facet_v2 import (
+    job_type_job,
+    schema_dataset,
+)
 
+from openlineage_confluent.config import ConfluentConfig, OpenLineageConfig
 from openlineage_confluent.confluent.kafka_rest_client import TopicMetadata
 from openlineage_confluent.confluent.models import LineageEdge, LineageGraph, TopicThroughput
 from openlineage_confluent.confluent.schema_registry_client import SchemaField, TopicSchema
-from openlineage_confluent.config import ConfluentConfig, OpenLineageConfig
 from openlineage_confluent.mapping.facets import (
     ConfluentDatasetFacet,
     ConfluentJobFacet,
@@ -92,7 +95,7 @@ class ConfluentOpenLineageMapper:
         cycle_key: str = "default",
     ) -> list[RunEvent]:
         """Convert all lineage edges into RunEvents, one per job."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # Group edges by (job_name, job_type, job_namespace_hint)
         job_edges: dict[tuple[str, str, str], list[LineageEdge]] = defaultdict(list)

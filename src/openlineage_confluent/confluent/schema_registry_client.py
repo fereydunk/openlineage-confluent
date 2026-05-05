@@ -44,7 +44,7 @@ class SchemaField:
     name: str
     type: str
     description: str | None = None
-    fields: list["SchemaField"] = field(default_factory=list)
+    fields: list[SchemaField] = field(default_factory=list)
 
 
 @dataclass
@@ -174,7 +174,7 @@ class SchemaRegistryClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> "SchemaRegistryClient":
+    def __enter__(self) -> SchemaRegistryClient:
         return self
 
     def __exit__(self, *_: object) -> None:

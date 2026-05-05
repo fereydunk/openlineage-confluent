@@ -13,7 +13,6 @@ Run:
 from __future__ import annotations
 
 import json
-import os
 
 import boto3
 
@@ -125,7 +124,7 @@ def create_iam_role(iam, account_id: str, bucket: str) -> str:
         PolicyName="ol-lineage-tableflow-policy",
         PolicyDocument=json.dumps(policy),
     )
-    print(f"[IAM] Attached inline policy (S3 + Glue)")
+    print("[IAM] Attached inline policy (S3 + Glue)")
     return role_arn
 
 

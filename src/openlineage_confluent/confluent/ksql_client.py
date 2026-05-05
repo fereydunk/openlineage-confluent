@@ -163,7 +163,7 @@ class KsqlDbClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> "KsqlDbClient":
+    def __enter__(self) -> KsqlDbClient:
         return self
 
     def __exit__(self, *_: object) -> None:

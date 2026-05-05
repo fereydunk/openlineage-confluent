@@ -88,7 +88,7 @@ class KafkaRestClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> "KafkaRestClient":
+    def __enter__(self) -> KafkaRestClient:
         return self
 
     def __exit__(self, *_: object) -> None:

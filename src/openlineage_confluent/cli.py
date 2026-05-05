@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -39,7 +39,7 @@ def _load_config(config_file: Path | None) -> AppConfig:
 
 @app.command()
 def run_once(
-    config: Annotated[Optional[Path], typer.Option("--config", "-c")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Run a single poll cycle and exit."""
@@ -60,7 +60,7 @@ def run_once(
 
 @app.command()
 def run(
-    config: Annotated[Optional[Path], typer.Option("--config", "-c")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Run continuously, waiting `poll_interval_seconds` between cycles.
@@ -88,7 +88,7 @@ def run(
 
 @app.command()
 def validate(
-    config: Annotated[Optional[Path], typer.Option("--config", "-c")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Fetch lineage graph and print a summary — no events emitted."""

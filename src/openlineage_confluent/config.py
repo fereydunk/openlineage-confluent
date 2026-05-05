@@ -263,7 +263,7 @@ class AppConfig:
         self.pipeline = pipeline
 
     @classmethod
-    def from_env(cls) -> "AppConfig":
+    def from_env(cls) -> AppConfig:
         return cls(
             confluent=ConfluentConfig(),
             openlineage=OpenLineageConfig(),
@@ -271,7 +271,7 @@ class AppConfig:
         )
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "AppConfig":
+    def from_yaml(cls, path: Path) -> AppConfig:
         raw = yaml.safe_load(path.read_text()) or {}
         raw = _apply_legacy_shim(raw)
         return cls(

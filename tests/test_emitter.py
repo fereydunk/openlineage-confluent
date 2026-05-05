@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 from openlineage.client.event_v2 import InputDataset, Job, OutputDataset, Run, RunEvent, RunState
 
 from openlineage_confluent.emitter.emitter import LineageEmitter, _event_fingerprint
 from openlineage_confluent.emitter.state_store import StateStore
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -34,7 +31,7 @@ def _make_event(
 ) -> RunEvent:
     return RunEvent(
         eventType=RunState.COMPLETE,
-        eventTime=datetime.now(timezone.utc).isoformat(),
+        eventTime=datetime.now(UTC).isoformat(),
         job=Job(namespace=namespace, name=job_name),
         run=Run(runId="00000000-0000-0000-0000-000000000001"),
         inputs=[InputDataset(namespace="kafka://broker:9092", name=t) for t in inputs],

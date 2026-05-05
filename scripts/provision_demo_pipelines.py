@@ -82,22 +82,9 @@ PIDS_FILE:  Path = SCRIPT_DIR / "demo_pipelines_consumers.pids"
 WORKER_SCRIPT = SCRIPT_DIR / "demo_pipelines_consumer_worker.py"
 
 
-def _parse_cloud_region(bootstrap: str) -> tuple[str, str]:
-    """Extract (cloud, region) from a Confluent Cloud Kafka bootstrap string.
-
-    Bootstrap format: pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
-    e.g.  pkc-921jm.us-east-2.aws.confluent.cloud:9092 → ("aws", "us-east-2")
-
-    Returns ("", "") if the bootstrap doesn't match the expected shape, in
-    which case Flink CLI calls will fall back to whatever region the user's
-    `confluent` context has selected (or fail with the original error).
-    """
-    host = bootstrap.split(":", 1)[0]   # strip port
-    parts = host.split(".")
-    # Expect at least: pkc-XXX, region, cloud, confluent, cloud
-    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
-        return parts[-3], parts[-4]
-    return "", ""
+# Shared parser — same fn used by the bridge and the wizard. Lives in the
+# project's `confluent.topology` module to avoid 3-way duplication.
+from openlineage_confluent.confluent.topology import parse_cloud_region as _parse_cloud_region  # noqa: E402
 
 
 def _load_env_creds(config_path: Path, env_id: str) -> None:
@@ -149,17 +136,17 @@ def _load_env_creds(config_path: Path, env_id: str) -> None:
     # against a us-east-2 Kafka cluster — Flink couldn't read the cluster's
     # topics. Now also catches Schema Registry in a different region from
     # the cluster (would force cross-region SR lookups on every produce).
-    print(f"\n══ Region alignment check ══")
+    print("\n══ Region alignment check ══")
     print(f"  Kafka cluster ({CLUSTER_ID})  : {FLINK_CLOUD or '?'}/{FLINK_REGION or '?'}")
     if SR_ENDPOINT:
         same = SR_REGION == FLINK_REGION and SR_REGION
         marker = "✓" if same else "⚠"
         print(f"  Schema Registry           : {FLINK_CLOUD or '?'}/{SR_REGION or '?'}  {marker}")
         if not same and SR_REGION:
-            print(f"  ⚠ SR region differs from cluster region — every produce/fetch crosses regions.")
-            print(f"    Recommend: enable SR in the cluster's region via the Cloud UI.")
+            print("  ⚠ SR region differs from cluster region — every produce/fetch crosses regions.")
+            print("    Recommend: enable SR in the cluster's region via the Cloud UI.")
     else:
-        print(f"  Schema Registry           : (not configured) ⚠")
+        print("  Schema Registry           : (not configured) ⚠")
     if FLINK_POOL:
         print(f"  Flink compute pool ({FLINK_POOL}): inspecting…")
         # Pool region is queried lazily by _flink_region_args(); call it now
@@ -171,8 +158,9 @@ def _load_env_creds(config_path: Path, env_id: str) -> None:
             marker = "✓" if same_pool else "⚠"
             print(f"  Flink compute pool        : {pool_cloud}/{pool_region}  {marker}")
             if not same_pool:
-                print(f"  ⚠ Flink pool region differs from cluster — Flink can't read this cluster's topics.")
-                print(f"    Recommend: delete this pool and re-provision so the wizard creates one in the cluster's region.")
+                print("  ⚠ Flink pool region differs from cluster — Flink can't read this cluster's topics.")
+                print("    Recommend: delete this pool and re-provision so the wizard")
+                print("    creates one in the cluster's region.")
     print(f"  Schema serialization      : {SCHEMA_TYPE}")
     print()
 
@@ -229,8 +217,10 @@ FROM `{in_}`;
 _ENRICHED_COLS = "ordertime, orderid, itemid, orderunits, city, state, zipcode, risk_tier"
 IDENTITY_SQL_VARIANTS = (
     f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}`;",
-    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}` WHERE orderunits >= 0;",
-    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}` WHERE risk_tier <> 'NONE';",
+    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} "
+    f"FROM `{{in_}}` WHERE orderunits >= 0;",
+    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} "
+    f"FROM `{{in_}}` WHERE risk_tier <> 'NONE';",
 )
 
 # Stage-name suffixes for visual variety in Marquez (purely cosmetic).
@@ -585,7 +575,7 @@ def _ensure_java_jar() -> bool:
     )
     if r.returncode != 0 or not JAVA_DEMO_JAR.exists():
         print(f"  ✗ JAR build failed (rc={r.returncode}): {r.stderr.strip()[:300]}")
-        print(f"  Install JDK 21 + Maven, or run manually: make java-demo-build")
+        print("  Install JDK 21 + Maven, or run manually: make java-demo-build")
         return False
     print(f"  ✓ Built {JAVA_DEMO_JAR.name}")
     return True
@@ -651,7 +641,8 @@ def start_native_producers(producer_specs: list[dict]) -> list[int]:
             env=env, stdout=log_fh, stderr=subprocess.STDOUT,
         )
         pids.append(proc.pid)
-        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} ({_region_label()}, {SCHEMA_TYPE}, pid={proc.pid}, log={log_path.name})")
+        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} "
+              f"({_region_label()}, {SCHEMA_TYPE}, pid={proc.pid}, log={log_path.name})")
     return pids
 
 
@@ -661,7 +652,10 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     pipelines = generate_pipelines(num_pipelines, min_nodes, max_nodes, seed=seed)
     rng = random.Random(seed)
 
-    range_str = f"exactly {min_nodes}" if min_nodes == max_nodes else f"random length in [{min_nodes}, {max_nodes}]"
+    range_str = (
+        f"exactly {min_nodes}" if min_nodes == max_nodes
+        else f"random length in [{min_nodes}, {max_nodes}]"
+    )
     n_datagen  = sum(1 for p in pipelines if not p.uses_native_producer)
     n_producer = sum(1 for p in pipelines if p.uses_native_producer)
     summary_line = (
@@ -742,7 +736,7 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
                 "job_namespace":  f"kafka-producer://{CLUSTER_ID}",
                 "job_name":       head_name,
             })
-            print(f"     producer (deferred — will spawn after all Flink stages are RUNNING)")
+            print("     producer (deferred — will spawn after all Flink stages are RUNNING)")
         else:
             if p.domain in connectors:
                 print(f"     connector ✓ (already exists, id={connectors[p.domain]})")
@@ -755,7 +749,7 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
             # SR and start producing. Pre-registered schema means no
             # auto-register conflict — 15s is enough for the connector to
             # transition to RUNNING and Flink to find data on the topic.
-            print(f"     ⏳ waiting 15s for Datagen to start producing...")
+            print("     ⏳ waiting 15s for Datagen to start producing...")
             time.sleep(15)
         save_state(state)
 
@@ -769,7 +763,7 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
             if SR_ENDPOINT and SR_KEY and SR_SECRET:
                 sr_register(out_topic, ENRICHED_SCHEMA)
             if name in statements:
-                print(f"     flink ✓ (already exists)")
+                print("     flink ✓ (already exists)")
             else:
                 sql = _flink_sql(k, in_topic, out_topic, rng)
                 if create_flink_statement(name, sql):
@@ -780,7 +774,7 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
         if p.consumer_group:
             print(f"\n  ⓩ <{p.topics[-1]}> → [consumer {p.consumer_group}]")
             consumer_pairs.append((p.consumer_group, p.topics[-1]))
-            print(f"     consumer (deferred — will spawn after all stages are up)")
+            print("     consumer (deferred — will spawn after all stages are up)")
 
         print(f"\n  ══ Pipeline {p.domain} build complete ══")
 
@@ -1069,7 +1063,7 @@ def teardown() -> None:
         if r.returncode == 0:
             print(f"  pkilled {label} (pattern={pattern!r})")
         elif r.returncode == 127:
-            print(f"  ⚠ pkill not in PATH — skipping orphan-process sweep")
+            print("  ⚠ pkill not in PATH — skipping orphan-process sweep")
             break
 
     # ── Phase 1: state-tracked cleanup ──────────────────────────────────────

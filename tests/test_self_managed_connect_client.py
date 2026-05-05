@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openlineage_confluent.confluent.self_managed_connect_client import SelfManagedConnectClient
 from openlineage_confluent.config import SelfManagedConnectClusterConfig
+from openlineage_confluent.confluent.self_managed_connect_client import SelfManagedConnectClient
 
 
 @pytest.fixture()

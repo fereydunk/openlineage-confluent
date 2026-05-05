@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from datetime import UTC
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -99,8 +100,8 @@ class StateStore:
         The full-replace strategy keeps the SQLite write simple and correct
         without requiring per-row upsert logic.
         """
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
+        from datetime import datetime
+        now = datetime.now(UTC).isoformat()
 
         rows = [
             (job_key, ns, name, fingerprints.get(job_key, ""), now)
@@ -132,7 +133,7 @@ class StateStore:
         except Exception:
             pass
 
-    def __enter__(self) -> "StateStore":
+    def __enter__(self) -> StateStore:
         return self
 
     def __exit__(self, *_: object) -> None:

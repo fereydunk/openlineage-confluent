@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 from openlineage_confluent.config import AppConfig, ConfluentConfig, EnvDeployment
 from openlineage_confluent.confluent.client import ConfluentLineageClient
@@ -123,7 +123,7 @@ class LineagePipeline:
         """Execute one poll → map → emit cycle."""
         self._maybe_reload_envs()
         self._cycle += 1
-        cycle_key = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        cycle_key = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
         log.info("=== Poll cycle #%d  key=%s ===", self._cycle, cycle_key)
 
         t0 = time.monotonic()
@@ -209,7 +209,7 @@ class LineagePipeline:
         self._client.close()
         self._store.close()
 
-    def __enter__(self) -> "LineagePipeline":
+    def __enter__(self) -> LineagePipeline:
         return self
 
     def __exit__(self, *_: object) -> None:

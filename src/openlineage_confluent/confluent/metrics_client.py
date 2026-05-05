@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
 from openlineage_confluent.config import ConfluentConfig
-from openlineage_confluent.confluent.models import ConsumerGroupInfo, KafkaProducerInfo, TopicThroughput
+from openlineage_confluent.confluent.models import (
+    ConsumerGroupInfo,
+    KafkaProducerInfo,
+    TopicThroughput,
+)
 
 log = logging.getLogger(__name__)
 
@@ -254,7 +258,7 @@ class MetricsApiClient:
 
     def _query_interval(self) -> str:
         """ISO 8601 interval covering the last N minutes, aligned to minutes."""
-        now   = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        now   = datetime.now(UTC).replace(second=0, microsecond=0)
         start = now - timedelta(minutes=self._lookback)
         return f"{start.isoformat()}/{now.isoformat()}"
 
@@ -334,7 +338,7 @@ class MetricsApiClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> "MetricsApiClient":
+    def __enter__(self) -> MetricsApiClient:
         return self
 
     def __exit__(self, *_: object) -> None:

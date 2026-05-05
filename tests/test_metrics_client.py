@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openlineage_confluent.confluent.metrics_client import MetricsApiClient, _INTERNAL_PREFIXES
 from openlineage_confluent.config import ConfluentConfig, EnvDeployment
+from openlineage_confluent.confluent.metrics_client import MetricsApiClient
 
 
 def _cfg(**overrides) -> ConfluentConfig:
@@ -181,7 +181,10 @@ def _throughput_responses(by_metric: dict[str, list[dict]]) -> list[MagicMock]:
     received_bytes, sent_bytes, received_records, sent_records.
     """
     from openlineage_confluent.confluent.metrics_client import (
-        _RECEIVED_BYTES, _SENT_BYTES, _RECEIVED_RECORDS, _SENT_RECORDS,
+        _RECEIVED_BYTES,
+        _RECEIVED_RECORDS,
+        _SENT_BYTES,
+        _SENT_RECORDS,
     )
     order = [_RECEIVED_BYTES, _SENT_BYTES, _RECEIVED_RECORDS, _SENT_RECORDS]
     return [_mock_metrics_response(by_metric.get(m, [])) for m in order]

@@ -37,7 +37,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 # Set these as environment variables or edit the defaults below.
@@ -96,7 +96,7 @@ def produce(topic: str, n: int) -> None:
             "id":        str(uuid.uuid4()),
             "sequence":  i,
             "amount":    round(100.0 + i * 13.7, 2),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         })
         p.produce(topic, value=payload.encode(), on_delivery=on_delivery)
         if i % 5 == 0:

@@ -161,7 +161,7 @@ class SelfManagedConnectClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> "SelfManagedConnectClient":
+    def __enter__(self) -> SelfManagedConnectClient:
         return self
 
     def __exit__(self, *_: object) -> None:

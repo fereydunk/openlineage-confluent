@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from openlineage_confluent.confluent.models import (
     ConnectorInfo,
     ConsumerGroupInfo,
@@ -12,11 +10,9 @@ from openlineage_confluent.confluent.models import (
     LineageGraph,
 )
 from openlineage_confluent.confluent.sql_parser import (
-    extract_input_tables,
     extract_output_tables,
     parse_statement,
 )
-
 
 # ── SQL parser ─────────────────────────────────────────────────────────────────
 

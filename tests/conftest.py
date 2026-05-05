@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from openlineage_confluent.config import ConfluentConfig, EnvDeployment, OpenLineageConfig
 from openlineage_confluent.confluent.models import (
     ConnectorInfo,
     ConsumerGroupInfo,
@@ -13,8 +14,6 @@ from openlineage_confluent.confluent.models import (
     LineageEdge,
     LineageGraph,
 )
-from openlineage_confluent.config import ConfluentConfig, EnvDeployment, OpenLineageConfig
-
 
 # ── Config fixtures ────────────────────────────────────────────────────────────
 

@@ -8,7 +8,7 @@ are intentionally left untouched so lineage continuity survives the rebuild.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -21,7 +21,6 @@ from openlineage_confluent.config import (
     PipelineConfig,
 )
 from openlineage_confluent.pipeline import LineagePipeline, _env_signature, _envs_signature
-
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 

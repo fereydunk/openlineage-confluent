@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import re
 
-
 # Regex for backtick-quoted identifiers  (`my-topic`)
 _BACKTICK_ID = r"`([^`]+)`"
 # Regex for plain identifiers (no special chars)

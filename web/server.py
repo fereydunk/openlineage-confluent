@@ -29,8 +29,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import select
-import shlex
 import signal
 import subprocess
 import sys
@@ -273,8 +271,8 @@ def _probe_cloud_api_key(key: str, secret: str) -> bool:
     if not (key and secret):
         return False
     import base64
-    import urllib.request
     import urllib.error
+    import urllib.request
     req = urllib.request.Request(
         "https://api.confluent.cloud/iam/v2/users?page_size=1",
         headers={
@@ -400,7 +398,7 @@ def _provision_env(env_id: str, env_name: str) -> dict:
         out["flink_compute_pool"] = pools[0].get("id", "")
         log.append(f"✓ Flink pool {out['flink_compute_pool']}")
     else:
-        log.append(f"⚠ no Flink compute pools (load-test will skip Flink steps)")
+        log.append("⚠ no Flink compute pools (load-test will skip Flink steps)")
 
     return out
 
@@ -764,20 +762,12 @@ _DEFAULT_KAFKA_TYPE  = "basic"
 _DEFAULT_FLINK_CFU   = "10"
 
 
-def _parse_cloud_region_from_bootstrap(bootstrap: str) -> tuple[str, str]:
-    """Extract (cloud, region) from a Confluent Cloud Kafka bootstrap host.
-
-    Bootstrap shape: pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
-    e.g. pkc-921jm.us-east-2.aws.confluent.cloud:9092 → ("aws", "us-east-2")
-
-    Returns ("", "") when the bootstrap doesn't match the expected shape; the
-    caller should fall back to _DEFAULT_CLOUD / _DEFAULT_REGION in that case.
-    """
-    host = (bootstrap or "").split(":", 1)[0]
-    parts = host.split(".")
-    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
-        return parts[-3], parts[-4]
-    return "", ""
+# Shared with the bridge + demo provisioner — single canonical impl in
+# the project's `confluent.topology` module. Kept under the legacy local
+# name so no call sites in this file change.
+from openlineage_confluent.confluent.topology import (  # noqa: E402
+    parse_cloud_region as _parse_cloud_region_from_bootstrap,
+)
 
 
 def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
@@ -940,7 +930,7 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
     # SR cluster itself was already described in Step 0 to determine the
     # canonical region. Now mint or reuse the API key the bridge will use to
     # talk to it.
-    emit(f"\n══ Step 2/4 — Schema Registry API key ══")
+    emit("\n══ Step 2/4 — Schema Registry API key ══")
     if sr_id:
         emit(f"✓ Schema Registry {sr_id} at {sr_endpoint} ({target_cloud}/{target_region})")
         if existing and existing.get("has_sr"):
@@ -954,7 +944,7 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
             for e in (raw.get("confluent") or {}).get("environments") or []:
                 if e.get("env_id") == env_id and e.get("schema_registry"):
                     entry["schema_registry"] = e["schema_registry"]
-            emit(f"  ✓ Reusing existing SR API key")
+            emit("  ✓ Reusing existing SR API key")
         else:
             emit(f"… Minting SR API key for {sr_id}")
             sr_key, err = _create_api_key(sr_id, env_id, "openlineage-confluent-sr")
@@ -1021,7 +1011,7 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
         entry["flink_compute_pool"] = pool_id
 
     # ── Step 4: Persist resolved EnvDeployment to config.yaml ──────────────
-    emit(f"\n══ Step 4/4 — Persist to config.yaml ══")
+    emit("\n══ Step 4/4 — Persist to config.yaml ══")
     _upsert_environment(entry)
     emit(f"✓ Saved env {env_id} ({env_name or '?'}) to config.yaml "
          f"(cluster={cluster_id} '{cluster_name or '?'}', "
@@ -2216,7 +2206,8 @@ async function ltTeardown() {
                'This cannot be undone.')) return;
   const btn = document.getElementById('lt-teardown-btn');
   btn.disabled = true;
-  stat.innerHTML = '<span class="dim">deleting all ol-* demo pipelines (state-tracked + stateless sweep)…</span>';
+  stat.innerHTML = '<span class="dim">deleting all ol-* demo pipelines '
+                 + '(state-tracked + stateless sweep)…</span>';
   document.getElementById('lt-log').classList.remove('hidden');
   document.getElementById('lt-log').textContent = '';
   try {
@@ -2462,7 +2453,26 @@ class Handler(BaseHTTPRequestHandler):
                 tail = "\n".join(out.splitlines()[-12:]) if out else ""
                 self._send_json(500, {"error": tail or f"exit {rc}"})
                 return
-            self._send_json(200, {"ok": True, "output": out[-2000:]})
+            # When Marquez is wiped, also wipe the bridge's diff-tracking
+            # SQLite state so the next bridge run re-emits everything fresh.
+            # Without this, the bridge sees fingerprints in its local DB and
+            # reports events_skipped=N events_emitted=0 against the empty
+            # Marquez — silent failure mode the user hit before this fix.
+            wiped_state_db = False
+            if action == "wipe":
+                from openlineage_confluent.config import _DEFAULT_STATE_DB
+                try:
+                    _DEFAULT_STATE_DB.unlink(missing_ok=True)
+                    # Also remove WAL/SHM siblings if any
+                    for ext in ("-wal", "-shm"):
+                        Path(str(_DEFAULT_STATE_DB) + ext).unlink(missing_ok=True)
+                    wiped_state_db = True
+                except OSError as exc:
+                    out += f"\n[bridge state] could not remove {_DEFAULT_STATE_DB}: {exc}"
+            self._send_json(200, {
+                "ok": True, "output": out[-2000:],
+                "wiped_bridge_state": wiped_state_db,
+            })
 
         elif path == "/loadtest/start":
             env_id = (data.get("env_id") or "").strip()
@@ -2523,7 +2533,29 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _kill_orphan_bridges() -> None:
+    """SIGTERM any `ol-confluent run` process from a previous wizard session.
+
+    The wizard's _bridge_state dict is in-memory only — when the wizard
+    restarts it loses track of any bridge it spawned, but the OS leaves
+    those subprocesses as orphans. Multiple bridges then compete for the
+    same SQLite state file and confuse the user (the wizard says "bridge
+    not running" while events keep showing up in Marquez).
+
+    Match on the full command-line path to our venv's ol-confluent binary
+    so we never hit unrelated processes. pkill -f returns 0 when something
+    was killed, 1 when nothing matched, 127 if pkill is missing — the
+    last two are silently fine.
+    """
+    venv_bin = REPO_DIR / ".venv" / "bin" / "ol-confluent"
+    pattern  = f"{venv_bin} run"
+    r = subprocess.run(["pkill", "-f", pattern], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"  Killed orphan bridge process(es) matching {pattern!r}")
+
+
 def main() -> None:
+    _kill_orphan_bridges()
     print(f"OpenLineage-Confluent setup wizard → http://localhost:{PORT}")
     print("Press Ctrl-C to stop.")
     try:

@@ -219,7 +219,8 @@ def main() -> None:
 Tableflow setup complete.
 
   Tableflow will begin syncing orders-enriched → s3://{bucket}/orders_enriched/
-  Glue table will appear in database '{os.environ.get("AWS_GLUE_DATABASE", "ol_lineage")}' after first flush (~2 min).
+  Glue table will appear in database '{os.environ.get("AWS_GLUE_DATABASE", "ol_lineage")}'
+  after the first flush (~2 min).
 
 Next:
   1. Wait 2-3 min for Tableflow flush + Glue table registration

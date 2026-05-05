@@ -9,12 +9,11 @@ successful poll instead of being falsely removed.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-
 from openlineage.client.event_v2 import Dataset, Job, Run, RunEvent, RunState
 
 from openlineage_confluent.config import (
@@ -24,7 +23,6 @@ from openlineage_confluent.config import (
 from openlineage_confluent.confluent.metrics_client import MetricsApiClient
 from openlineage_confluent.emitter.emitter import LineageEmitter
 from openlineage_confluent.emitter.state_store import StateStore
-
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -48,7 +46,7 @@ def emitter(tmp_path) -> LineageEmitter:
 def _make_event(namespace: str, name: str, output_topic: str = "t") -> RunEvent:
     return RunEvent(
         eventType=RunState.RUNNING,
-        eventTime=datetime.now(timezone.utc).isoformat(),
+        eventTime=datetime.now(UTC).isoformat(),
         job=Job(namespace=namespace, name=name),
         run=Run(runId="00000000-0000-0000-0000-000000000000"),
         producer="test/1.0",

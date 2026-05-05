@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from openlineage.client.event_v2 import RunState
 
 from openlineage_confluent.confluent.kafka_rest_client import TopicMetadata

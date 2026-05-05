@@ -24,7 +24,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-
 # ── 1. /envs/select HTTP handler ──────────────────────────────────────────────
 
 @pytest.fixture()
@@ -266,8 +265,8 @@ def test_bridge_provision_pending_succeeds_for_all_envs(server_module):
 # ── 3. Global ksqlDB / self-managed-Connect failed_namespaces ──────────────
 
 def test_global_graph_quarantines_ksqldb_namespace_on_client_failure():
-    from openlineage_confluent.confluent.client import ConfluentLineageClient
     from openlineage_confluent.config import ConfluentConfig, KsqlClusterConfig
+    from openlineage_confluent.confluent.client import ConfluentLineageClient
 
     cfg = ConfluentConfig(
         CONFLUENT_CLOUD_API_KEY="k", CONFLUENT_CLOUD_API_SECRET="s",
@@ -287,8 +286,8 @@ def test_global_graph_quarantines_ksqldb_namespace_on_client_failure():
 
 
 def test_global_graph_quarantines_self_managed_connect_on_failure():
-    from openlineage_confluent.confluent.client import ConfluentLineageClient
     from openlineage_confluent.config import ConfluentConfig, SelfManagedConnectClusterConfig
+    from openlineage_confluent.confluent.client import ConfluentLineageClient
 
     cfg = ConfluentConfig(
         CONFLUENT_CLOUD_API_KEY="k", CONFLUENT_CLOUD_API_SECRET="s",
@@ -307,8 +306,8 @@ def test_global_graph_quarantines_self_managed_connect_on_failure():
 
 
 def test_global_graph_no_failed_namespaces_when_all_ok():
-    from openlineage_confluent.confluent.client import ConfluentLineageClient
     from openlineage_confluent.config import ConfluentConfig, KsqlClusterConfig
+    from openlineage_confluent.confluent.client import ConfluentLineageClient
 
     cfg = ConfluentConfig(
         CONFLUENT_CLOUD_API_KEY="k", CONFLUENT_CLOUD_API_SECRET="s",

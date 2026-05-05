@@ -15,7 +15,6 @@ from openlineage_confluent.confluent.schema_registry_client import (
     _parse_json_schema,
 )
 
-
 # ── Avro parser ────────────────────────────────────────────────────────────────
 
 def test_avro_parser_primitive_fields() -> None:

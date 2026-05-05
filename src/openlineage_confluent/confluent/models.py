@@ -20,7 +20,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from openlineage_confluent.confluent.kafka_rest_client import TopicMetadata
 from openlineage_confluent.confluent.schema_registry_client import TopicSchema
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-topic throughput  (defined here to avoid a circular import between
 # metrics_client.py and models.py)

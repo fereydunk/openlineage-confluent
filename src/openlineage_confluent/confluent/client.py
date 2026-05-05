@@ -31,6 +31,10 @@ from typing import Any
 import httpx
 
 from openlineage_confluent.config import ConfluentConfig, EnvDeployment
+from openlineage_confluent.confluent.kafka_rest_client import (
+    KafkaRestClient,
+    TopicMetadata,
+)
 from openlineage_confluent.confluent.ksql_client import KsqlDbClient
 from openlineage_confluent.confluent.metrics_client import MetricsApiClient
 from openlineage_confluent.confluent.models import (
@@ -45,52 +49,28 @@ from openlineage_confluent.confluent.models import (
     TableflowTopic,
     TopicThroughput,
 )
-from openlineage_confluent.confluent.kafka_rest_client import (
-    KafkaRestClient,
-    TopicMetadata,
-)
 from openlineage_confluent.confluent.schema_registry_client import (
     SchemaRegistryClient,
     TopicSchema,
 )
 from openlineage_confluent.confluent.self_managed_connect_client import SelfManagedConnectClient
-from openlineage_confluent.confluent.tableflow_client import TableflowClient
 from openlineage_confluent.confluent.sql_parser import parse_statement
+from openlineage_confluent.confluent.tableflow_client import TableflowClient
+
+# Topology helpers consolidated in confluent.topology so the wizard and the
+# demo provisioner share the same parser without duplicating implementations.
+# Re-exported under the legacy private names so existing in-tree call sites
+# that imported these from client.py keep working.
+from openlineage_confluent.confluent.topology import (
+    flink_region_args as _flink_region_args,
+)
+from openlineage_confluent.confluent.topology import (
+    parse_cloud_region as _parse_cloud_region,
+)
 
 log = logging.getLogger(__name__)
 
 _CLOUD_API = "https://api.confluent.cloud"
-
-
-def _parse_cloud_region(kafka_bootstrap: str) -> tuple[str, str]:
-    """Extract (cloud, region) from a Confluent Cloud Kafka bootstrap host.
-
-    Bootstrap format: pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
-    e.g. pkc-921jm.us-east-2.aws.confluent.cloud:9092 → ("aws", "us-east-2")
-
-    Returns ("", "") when the bootstrap doesn't match the expected shape.
-    """
-    host = (kafka_bootstrap or "").split(":", 1)[0]
-    parts = host.split(".")
-    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
-        return parts[-3], parts[-4]
-    return "", ""
-
-
-def _flink_region_args(kafka_bootstrap: str) -> list[str]:
-    """Cloud/region flags required by `confluent flink statement` commands.
-
-    The CLI errors with "no cloud provider and region selected" unless these
-    flags are passed (or the user has set a context with `confluent flink
-    region use`).
-
-    Returns [] when the bootstrap doesn't match the expected shape, in which
-    case the CLI falls back to whatever region the user's context has set.
-    """
-    cloud, region = _parse_cloud_region(kafka_bootstrap)
-    if cloud and region:
-        return ["--cloud", cloud, "--region", region]
-    return []
 
 
 class _EnvLineageClient:
@@ -645,7 +625,7 @@ class ConfluentLineageClient:
         for c in self._sm_connect_clients:
             c.close()
 
-    def __enter__(self) -> "ConfluentLineageClient":
+    def __enter__(self) -> ConfluentLineageClient:
         return self
 
     def __exit__(self, *_: object) -> None:

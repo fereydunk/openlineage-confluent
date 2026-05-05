@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openlineage_confluent.confluent.ksql_client import KsqlDbClient
 from openlineage_confluent.config import KsqlClusterConfig
+from openlineage_confluent.confluent.ksql_client import KsqlDbClient
 
 
 @pytest.fixture()

@@ -16,13 +16,13 @@ import logging
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import partial
 
 from openlineage.client import OpenLineageClient
 from openlineage.client.event_v2 import Job, Run, RunEvent, RunState
-from openlineage.client.transport.http import ApiKeyTokenProvider, HttpConfig, HttpTransport
 from openlineage.client.transport.console import ConsoleConfig, ConsoleTransport
+from openlineage.client.transport.http import ApiKeyTokenProvider, HttpConfig, HttpTransport
 
 from openlineage_confluent.config import OpenLineageConfig
 from openlineage_confluent.emitter.state_store import StateStore
@@ -201,7 +201,7 @@ class LineageEmitter:
         """Emit an ABORT event for a job that has disappeared from the lineage graph."""
         event = RunEvent(
             eventType=RunState.ABORT,
-            eventTime=datetime.now(timezone.utc).isoformat(),
+            eventTime=datetime.now(UTC).isoformat(),
             job=Job(namespace=namespace, name=name),
             run=Run(runId=str(uuid.uuid4())),
             producer=self._cfg.producer,
