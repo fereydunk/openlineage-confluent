@@ -155,17 +155,25 @@ def test_variety_appears_in_a_realistic_run(script_module):
     assert all(n % 2 == 1 for n in distinct_lengths), distinct_lengths
 
 
-def test_first_flink_stage_is_enrich(script_module):
-    """Stage 0 SQL projects + enriches (CASE risk_tier)."""
+def test_first_flink_stage_preserves_orders_schema(script_module):
+    """Stage 0 is schema-preserving — copies every RAW_ORDERS column through
+    so the head topic and the first Flink output topic share an identical
+    schema. (Earlier versions had stage 0 transform RAW → ENRICHED with a
+    flatten + risk_tier addition, but that broke the "one schema per
+    pipeline" invariant.)"""
     import random
     rng = random.Random(0)
     sql = script_module._flink_sql(0, "in_topic", "out_topic", rng)
-    assert "risk_tier" in sql
+    for col in ("ordertime", "orderid", "itemid", "orderunits", "address"):
+        assert col in sql, f"missing column {col!r}: {sql}"
     assert "INSERT INTO `out_topic`" in sql
     assert "FROM `in_topic`" in sql
+    # No transformation columns
+    assert "risk_tier" not in sql
+    assert "AS city" not in sql
 
 
-def test_later_flink_stages_preserve_enriched_schema(script_module):
+def test_later_flink_stages_preserve_orders_schema(script_module):
     """Stage 1+ uses identity-shape SELECT — schema-preserving copy of every
     value column (NOT SELECT *, which would also pull in Flink's implicit
     BYTES key column and break INSERT)."""
@@ -174,8 +182,9 @@ def test_later_flink_stages_preserve_enriched_schema(script_module):
     sqls = [script_module._flink_sql(k, "i", "o", rng) for k in range(1, 6)]
     for sql in sqls:
         # Each value column must appear in both the target list and the SELECT
-        for col in ("ordertime", "orderid", "itemid", "orderunits",
-                    "city", "state", "zipcode", "risk_tier"):
+        # (RAW_ORDERS shape — same as the head topic, since every stage is
+        # now schema-preserving rather than enriching).
+        for col in ("ordertime", "orderid", "itemid", "orderunits", "address"):
             assert col in sql, f"missing column {col!r} in SQL: {sql}"
         # Schema-preserving = no projection that drops columns
         assert "SELECT *" not in sql, f"identity stage must list columns explicitly, not SELECT *: {sql}"

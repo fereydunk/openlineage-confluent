@@ -49,10 +49,20 @@ import java.util.UUID;
 public class OrderProducer {
 
     // Mirrors RAW_ORDERS_SCHEMA in scripts/provision_demo_pipelines.py.
+    // MUST match RAW_ORDERS_SCHEMA in scripts/provision_demo_pipelines.py
+    // AND the kafka-connect-datagen ORDERS quickstart schema
+    // (mainline/datagen/src/main/resources/orders_schema.avro). Critical:
+    //   - record name MUST be "orders" (lowercase plural, NOT "Order"
+    //     singular) — Datagen uses lowercase, and SR rejects subjects with
+    //     schemas of different fully-qualified names as "incompatible".
+    //   - namespace MUST be "ksql" — same reason.
+    // Mismatch here means "Schema being registered is incompatible with an
+    // earlier schema for the subject" when Datagen and this producer both
+    // try to register a schema for the same topic subject.
     private static final String VALUE_SCHEMA_JSON = """
         {
           "type": "record",
-          "name": "Order",
+          "name": "orders",
           "namespace": "ksql",
           "fields": [
             {"name": "ordertime",  "type": "long"},

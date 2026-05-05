@@ -192,35 +192,27 @@ DOMAIN_PREFIXES = (
 # Flink expects 1 + N values and our SELECT only produces N → the statement
 # fails SQL validation with "Different number of columns". Listing the
 # value columns explicitly tells Flink "leave the key alone".
-ENRICH_SQL_TEMPLATE = """\
-INSERT INTO `{out}`
-  (ordertime, orderid, itemid, orderunits, city, state, zipcode, risk_tier)
-SELECT
-  ordertime,
-  orderid,
-  itemid,
-  orderunits,
-  address.city    AS city,
-  address.state   AS state,
-  address.zipcode AS zipcode,
-  CASE
-    WHEN orderunits > 10 THEN 'HIGH'
-    WHEN orderunits > 5  THEN 'MEDIUM'
-    ELSE                      'LOW'
-  END AS risk_tier
-FROM `{in_}`;
-"""
-
-# Identity transforms used for stages 2+ — schema-preserving copy with
-# rotating WHERE clauses so each stage is at least syntactically distinct.
-# Same `key BYTES` issue as above: explicit value-only column list.
-_ENRICHED_COLS = "ordertime, orderid, itemid, orderunits, city, state, zipcode, risk_tier"
+#
+# Per-pipeline single-schema invariant
+# ────────────────────────────────────
+# Every Flink stage in a pipeline is SCHEMA-PRESERVING — it copies the
+# value columns through unchanged so every topic in the chain has the
+# IDENTICAL schema (matches the source: Datagen's ORDERS quickstart, or
+# the Java OrderProducer's Avro record built from the same shape).
+# Optional WHERE clauses give each stage syntactic variety without
+# changing the output schema.
+#
+# We previously had a separate ENRICH_SQL that flattened address.city into
+# city and added a risk_tier column — that produced a different schema
+# downstream and broke the user's "one schema per pipeline" expectation.
+# Removed.
+_ORDERS_COLS = "ordertime, orderid, itemid, orderunits, address"
 IDENTITY_SQL_VARIANTS = (
-    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} FROM `{{in_}}`;",
-    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} "
+    f"INSERT INTO `{{out}}` ({_ORDERS_COLS}) SELECT {_ORDERS_COLS} FROM `{{in_}}`;",
+    f"INSERT INTO `{{out}}` ({_ORDERS_COLS}) SELECT {_ORDERS_COLS} "
     f"FROM `{{in_}}` WHERE orderunits >= 0;",
-    f"INSERT INTO `{{out}}` ({_ENRICHED_COLS}) SELECT {_ENRICHED_COLS} "
-    f"FROM `{{in_}}` WHERE risk_tier <> 'NONE';",
+    f"INSERT INTO `{{out}}` ({_ORDERS_COLS}) SELECT {_ORDERS_COLS} "
+    f"FROM `{{in_}}` WHERE orderunits < 1000000;",
 )
 
 # Stage-name suffixes for visual variety in Marquez (purely cosmetic).
@@ -307,22 +299,33 @@ def generate_pipelines(num_pipelines: int, min_nodes: int, max_nodes: int,
 
 
 def _flink_sql(stage_idx: int, in_topic: str, out_topic: str, rng: random.Random) -> str:
-    """First stage = enrich; later stages = identity (rotating SQL variants)."""
-    if stage_idx == 0:
-        return ENRICH_SQL_TEMPLATE.format(in_=in_topic, out=out_topic)
+    """Pick a schema-preserving identity SQL for this stage.
+
+    Every stage uses the same value-column list (RAW_ORDERS_SCHEMA shape) so
+    every topic in the pipeline ends up with the IDENTICAL schema. Optional
+    WHERE clauses give stages syntactic variety without changing the schema.
+    """
     template = rng.choice(IDENTITY_SQL_VARIANTS)
     return template.format(in_=in_topic, out=out_topic)
 
 
-# ─── Schemas pre-registered for each topic in the chain ─────────────────────
-# Datagen output topics get RAW_ORDERS_SCHEMA (matches the ORDERS quickstart
-# Datagen produces). Flink output topics get ENRICHED_SCHEMA (output of the
-# first enrich stage; later stages preserve schema via SELECT *). Pre-registering
-# means every topic shows up in CC's stream lineage with a schema attached
-# immediately, instead of waiting on Datagen's first produce to register.
+# ─── Single canonical schema for every topic in every pipeline ──────────────
+# This MUST match exactly what the Datagen connector's ORDERS quickstart
+# registers — Datagen registers its own value schema for the head topic on
+# first produce, so any pre-registered subject must be byte-compatible or SR
+# rejects with "incompatible with an earlier schema". The two critical bits:
+#   - record name MUST be "orders" (lowercase). Datagen uses lowercase plural.
+#     A previous version used "Order" (capitalized singular) which produced
+#     identical fields but a different fully-qualified name → SR rejects.
+#   - namespace MUST be "ksql". That's what the upstream
+#     kafka-connect-datagen/src/main/resources/orders_schema.avro declares.
+# Since every Flink stage is schema-preserving (see IDENTITY_SQL_VARIANTS
+# above) every topic in the pipeline ends up with this same schema —
+# Datagen-headed and native-producer-headed alike. The Java OrderProducer's
+# embedded VALUE_SCHEMA_JSON mirrors this exactly; keep them in sync.
 RAW_ORDERS_SCHEMA = json.dumps({
     "type": "record",
-    "name": "Order",
+    "name": "orders",
     "namespace": "ksql",
     "fields": [
         {"name": "ordertime",  "type": "long"},
@@ -337,22 +340,6 @@ RAW_ORDERS_SCHEMA = json.dumps({
                 {"name": "zipcode", "type": "long"},
             ],
         }},
-    ],
-})
-
-ENRICHED_SCHEMA = json.dumps({
-    "type": "record",
-    "name": "orders_enriched",
-    "namespace": "io.confluent.openlineage",
-    "fields": [
-        {"name": "ordertime",  "type": "long"},
-        {"name": "orderid",    "type": "int"},
-        {"name": "itemid",     "type": "string"},
-        {"name": "orderunits", "type": "double"},
-        {"name": "city",       "type": "string"},
-        {"name": "state",      "type": "string"},
-        {"name": "zipcode",    "type": "long"},
-        {"name": "risk_tier",  "type": "string"},
     ],
 })
 
@@ -761,7 +748,10 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
             # Output topic must exist before Flink writes to it.
             create_topic(out_topic, topics)
             if SR_ENDPOINT and SR_KEY and SR_SECRET:
-                sr_register(out_topic, ENRICHED_SCHEMA)
+                # Same schema as the head topic — every Flink stage is
+                # schema-preserving (identity SELECT) so every topic in the
+                # pipeline shares the IDENTICAL schema.
+                sr_register(out_topic, RAW_ORDERS_SCHEMA)
             if name in statements:
                 print("     flink ✓ (already exists)")
             else:
