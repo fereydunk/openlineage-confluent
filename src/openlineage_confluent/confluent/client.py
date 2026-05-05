@@ -221,9 +221,11 @@ class _EnvLineageClient:
     # ──────────────────────────────────────────────────────────────────────────
 
     def build_graph(self) -> LineageGraph:
-        env       = self._env.env_id
-        cluster   = self._env.cluster_id
-        bootstrap = self._env.kafka_bootstrap
+        env          = self._env.env_id
+        env_name     = self._env.env_name or ""
+        cluster      = self._env.cluster_id
+        cluster_name = self._env.cluster_name or ""
+        bootstrap    = self._env.kafka_bootstrap
         # Cloud + region are derived from the Kafka bootstrap host; stamped on
         # every LineageEdge so the mapper can attach Confluent topology
         # facets to jobs and datasets without re-parsing.
@@ -267,7 +269,9 @@ class _EnvLineageClient:
                         job_type="kafka_connect_source",
                         job_namespace_hint=ns,
                         kafka_bootstrap=bootstrap,
-                        env_id=env, cluster_id=cluster, cloud=cloud, region=region,
+                        env_id=env, env_name=env_name,
+                        cluster_id=cluster, cluster_name=cluster_name,
+                        cloud=cloud, region=region,
                     ))
             else:  # SINK
                 for topic in conn.topics_consumed():
@@ -280,7 +284,9 @@ class _EnvLineageClient:
                         job_type="kafka_connect_sink",
                         job_namespace_hint=ns,
                         kafka_bootstrap=bootstrap,
-                        env_id=env, cluster_id=cluster, cloud=cloud, region=region,
+                        env_id=env, env_name=env_name,
+                        cluster_id=cluster, cluster_name=cluster_name,
+                        cloud=cloud, region=region,
                     ))
 
         # ── 2. Flink statements ──────────────────────────────────────────────
@@ -301,7 +307,9 @@ class _EnvLineageClient:
                         job_type="flink_statement",
                         job_namespace_hint=f"flink://{env}",
                         kafka_bootstrap=bootstrap,
-                        env_id=env, cluster_id=cluster, cloud=cloud, region=region,
+                        env_id=env, env_name=env_name,
+                        cluster_id=cluster, cluster_name=cluster_name,
+                        cloud=cloud, region=region,
                     ))
 
         # ── 3. Kafka producers (Metrics API received_bytes + client_id) ──────
@@ -316,7 +324,9 @@ class _EnvLineageClient:
                     job_type="kafka_producer",
                     job_namespace_hint=f"kafka-producer://{cluster}",
                     kafka_bootstrap=bootstrap,
-                    env_id=env, cluster_id=cluster, cloud=cloud, region=region,
+                    env_id=env, env_name=env_name,
+                    cluster_id=cluster, cluster_name=cluster_name,
+                    cloud=cloud, region=region,
                 ))
 
         # ── 4. Consumer groups (Metrics API) ─────────────────────────────────
@@ -331,7 +341,9 @@ class _EnvLineageClient:
                     job_type="kafka_consumer_group",
                     job_namespace_hint=f"kafka-consumer-group://{cluster}",
                     kafka_bootstrap=bootstrap,
-                    env_id=env, cluster_id=cluster, cloud=cloud, region=region,
+                    env_id=env, env_name=env_name,
+                    cluster_id=cluster, cluster_name=cluster_name,
+                    cloud=cloud, region=region,
                 ))
 
         # ── 5. Tableflow: Kafka topic → Iceberg dataset ──────────────────────
@@ -354,7 +366,9 @@ class _EnvLineageClient:
                 job_type="tableflow",
                 job_namespace_hint=f"tableflow://{env}",
                 kafka_bootstrap=bootstrap,
-                env_id=env, cluster_id=cluster, cloud=cloud, region=region,
+                env_id=env, env_name=env_name,
+                cluster_id=cluster, cluster_name=cluster_name,
+                cloud=cloud, region=region,
             ))
 
         # ── 6. Schema Registry: schemas for every topic in graph ─────────────

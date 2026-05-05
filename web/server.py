@@ -805,7 +805,11 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
     """
     # Snapshot current config entry (legacy shim applies in _configured_env_ids)
     existing = next((e for e in _configured_env_ids() if e["env_id"] == env_id), None)
-    entry: dict = {"env_id": env_id, "_log": []}
+    # Fetch the env's human-readable name once. Surfaced on the Confluent
+    # topology facet (envName) so Marquez shows "test-lineage" instead of
+    # the opaque "env-dpog0y". Empty string is fine if the lookup fails.
+    env_name = next((e["name"] for e in _list_environments() if e["id"] == env_id), "")
+    entry: dict = {"env_id": env_id, "env_name": env_name, "_log": []}
 
     # ── Step 0: Anchor region — describe SR first ──────────────────────────
     emit("══ Step 0/4 — Determining canonical region (Schema Registry is the anchor) ══")
@@ -848,9 +852,10 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
             misaligned_clusters.append({"info": c, "cloud": c_cloud, "region": c_region})
 
     if aligned_clusters:
-        cluster_id = aligned_clusters[0].get("id", "")
+        cluster_id   = aligned_clusters[0].get("id", "")
+        cluster_name = aligned_clusters[0].get("name", "") or ""
         emit(f"✓ Reusing existing Kafka cluster {cluster_id} "
-             f"({aligned_clusters[0].get('name','')}, {target_cloud}/{target_region})")
+             f"({cluster_name}, {target_cloud}/{target_region})")
         if misaligned_clusters:
             for m in misaligned_clusters:
                 emit(f"  ⚠ Ignoring misaligned cluster {m['info'].get('id','?')} "
@@ -877,7 +882,8 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
         )
         if not ok or not isinstance(data, dict) or not data.get("id"):
             return False, f"kafka cluster create failed: {err or data}"
-        cluster_id = data["id"]
+        cluster_id   = data["id"]
+        cluster_name = data.get("name", "") or cname
         emit(f"  → cluster id {cluster_id} (provisioning)")
 
         # Poll until status reaches "UP" / "ACTIVE" — BASIC clusters take ~30s
@@ -892,7 +898,8 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
         else:
             return False, f"kafka cluster {cluster_id} never reached UP"
 
-    entry["cluster_id"] = cluster_id
+    entry["cluster_id"]   = cluster_id
+    entry["cluster_name"] = cluster_name
 
     desc, err = _describe_cluster(cluster_id, env_id)
     if err:
@@ -1016,9 +1023,10 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
     # ── Step 4: Persist resolved EnvDeployment to config.yaml ──────────────
     emit(f"\n══ Step 4/4 — Persist to config.yaml ══")
     _upsert_environment(entry)
-    emit(f"✓ Saved env {env_id} to config.yaml "
-         f"(cluster={cluster_id}, pool={pool_id or '∅'}, "
-         f"sr={sr_id or '∅'}, region={target_cloud}/{target_region})")
+    emit(f"✓ Saved env {env_id} ({env_name or '?'}) to config.yaml "
+         f"(cluster={cluster_id} '{cluster_name or '?'}', "
+         f"pool={pool_id or '∅'}, sr={sr_id or '∅'}, "
+         f"region={target_cloud}/{target_region})")
     return True, ""
 
 

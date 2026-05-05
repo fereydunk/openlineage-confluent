@@ -209,14 +209,18 @@ class ConfluentOpenLineageMapper:
 
     @staticmethod
     def _topology_from_edges(edges: list[LineageEdge]) -> dict:
-        """Pick the first non-empty (env_id, cluster_id, cloud, region) tuple
-        from the job's edges. All edges for one job share the same Confluent
-        topology, so the first non-empty value wins for each field."""
+        """Pick the first non-empty (env_id, env_name, cluster_id, cluster_name,
+        cloud, region) tuple from the job's edges. All edges for one job share
+        the same Confluent topology, so the first non-empty value wins for
+        each field. Empty strings render as "" in the facet — Marquez and
+        downstream consumers can treat them as "unknown"."""
         return {
-            "envId":     next((e.env_id     for e in edges if e.env_id),     "") or "",
-            "clusterId": next((e.cluster_id for e in edges if e.cluster_id), "") or "",
-            "cloud":     next((e.cloud      for e in edges if e.cloud),      "") or "",
-            "region":    next((e.region     for e in edges if e.region),     "") or "",
+            "envId":       next((e.env_id       for e in edges if e.env_id),       "") or "",
+            "envName":     next((e.env_name     for e in edges if e.env_name),     "") or "",
+            "clusterId":   next((e.cluster_id   for e in edges if e.cluster_id),   "") or "",
+            "clusterName": next((e.cluster_name for e in edges if e.cluster_name), "") or "",
+            "cloud":       next((e.cloud        for e in edges if e.cloud),        "") or "",
+            "region":      next((e.region       for e in edges if e.region),       "") or "",
         }
 
     # ------------------------------------------------------------------

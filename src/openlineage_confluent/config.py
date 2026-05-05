@@ -58,6 +58,13 @@ class EnvDeployment(BaseModel):
     cluster_id: str                       # lkc-xxxxxx — primary Kafka cluster
     kafka_bootstrap: str                  # pkc-xxx.<region>.aws.confluent.cloud:9092
 
+    # Human-readable names. Optional; populated by the wizard during
+    # _provision_env. The bridge surfaces both ID and name on the Confluent
+    # topology facet so Marquez consumers can show "test-lineage" instead of
+    # the opaque "env-dpog0y" in the UI.
+    env_name:     str | None = None       # e.g. "test-lineage"
+    cluster_name: str | None = None       # e.g. "cluster_0"
+
     # Optional per-env operational endpoints
     flink_compute_pool: str | None = None  # lfcp-xxxxxx (used by provisioning scripts)
 

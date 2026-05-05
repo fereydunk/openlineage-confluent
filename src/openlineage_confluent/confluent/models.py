@@ -213,12 +213,15 @@ class LineageEdge(BaseModel):
     # Confluent topology context — emitted as ConfluentJobFacet on jobs and
     # ConfluentDatasetFacet on Kafka topic datasets. Lets Marquez consumers
     # filter / group by env / cluster / region without having to parse the
-    # job namespace URI. None on globally-scoped sources (ksqlDB, self-managed
+    # job namespace URI. IDs are stable, names are human-readable for the
+    # Marquez UI. None on globally-scoped sources (ksqlDB, self-managed
     # Connect) where the env is irrelevant.
-    env_id:     str | None = None
-    cluster_id: str | None = None
-    cloud:      str | None = None    # "aws" | "gcp" | "azure"
-    region:     str | None = None    # e.g. "us-east-2"
+    env_id:       str | None = None
+    env_name:     str | None = None    # e.g. "test-lineage"
+    cluster_id:   str | None = None
+    cluster_name: str | None = None    # e.g. "cluster_0"
+    cloud:        str | None = None    # "aws" | "gcp" | "azure"
+    region:       str | None = None    # e.g. "us-east-2"
 
 
 class LineageGraph(BaseModel):

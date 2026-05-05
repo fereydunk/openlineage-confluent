@@ -695,41 +695,54 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     #
     # Native-producer pipelines: same chain, but the "head" is a Java client
     # spawned right after topic₀ + schema₀ are in place.
+    # Each pipeline is built as a sequence of "data-flow segments". A topic
+    # is never the left side of a segment — every topic is the OUTPUT of
+    # something on its left:
+    #
+    #   Segment 1:  producer/connector  →  head topic
+    #   Segment 2:  source topic + flink stage  →  output topic    (×N)
+    #   Segment 3:  final topic  →  consumer group
+    #
+    # Underneath, the topic must physically exist before the producer/Flink
+    # writes to it (Datagen connectors don't auto-create) — so the create
+    # order inside each segment is "create empty topic, register schema,
+    # then create producer/Flink" — but the framing in the log shows the
+    # producer as the source-of-data on the left.
     consumer_pairs:  list[tuple[str, str]] = []
     producer_specs:  list[dict]            = []
     for i, p in enumerate(pipelines, 1):
         head_kind = "native-producer-headed" if p.uses_native_producer else "Datagen-headed"
         print(f"\n══ Pipeline {i}/{len(pipelines)}: {p.domain} "
               f"({p.total_nodes} nodes, {head_kind}) ══")
-        print("  Building left to right:")
+        print("  Building data-flow segments left to right:")
 
-        # ── ① head topic + schema ──────────────────────────────────────────
-        print(f"\n  ① head topic")
+        # ── Segment 1: head producer/connector → head topic ────────────────
+        head_label   = ("Java producer" if p.uses_native_producer
+                        else "Datagen connector")
+        head_name    = (f"ol-{p.domain}-producer" if p.uses_native_producer
+                        else f"ol-{p.domain}-datagen")
+        print(f"\n  ① [{head_label} {head_name}] → <{p.topics[0]}>")
+        # Topic must exist before the producer writes — create it first,
+        # then attach the producer.
         create_topic(p.topics[0], topics)
         if SR_ENDPOINT and SR_KEY and SR_SECRET:
             # RAW_ORDERS_SCHEMA matches both the Datagen ORDERS quickstart
             # AND the Java OrderProducer's GenericRecord shape.
             sr_register(p.topics[0], RAW_ORDERS_SCHEMA)
         else:
-            print("  (SR not configured — skipping schema registration)")
-        save_state(state)
-
-        # ── ② head producer (Datagen connector OR Java producer) ───────────
-        head_label = ("Java producer" if p.uses_native_producer
-                      else "Datagen connector")
-        print(f"\n  ② head producer ({head_label} → {p.topics[0]})")
+            print("     (SR not configured — skipping schema registration)")
         if p.uses_native_producer:
             # Defer spawning until ALL topics + Flink statements are up — the
-            # Java producer would otherwise see "topic not found" if the
-            # Flink output topic isn't ready when the producer starts.
+            # Java producer would otherwise write into a topic whose downstream
+            # Flink hadn't been created yet.
             producer_specs.append({
                 "domain":         p.domain,
                 "topic":          p.topics[0],
-                "client_id":      f"ol-{p.domain}-producer",
+                "client_id":      head_name,
                 "job_namespace":  f"kafka-producer://{CLUSTER_ID}",
-                "job_name":       f"ol-{p.domain}-producer",
+                "job_name":       head_name,
             })
-            print(f"     (deferred — will spawn after all Flink stages are RUNNING)")
+            print(f"     producer (deferred — will spawn after all Flink stages are RUNNING)")
         else:
             if p.domain in connectors:
                 print(f"     connector ✓ (already exists, id={connectors[p.domain]})")
@@ -739,38 +752,35 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
                     connectors[p.domain] = conn_id
                     save_state(state)
             # Datagen needs a few seconds to register its writer schema with
-            # SR and start producing. Pre-registered schema in ① means no
+            # SR and start producing. Pre-registered schema means no
             # auto-register conflict — 15s is enough for the connector to
             # transition to RUNNING and Flink to find data on the topic.
             print(f"     ⏳ waiting 15s for Datagen to start producing...")
             time.sleep(15)
+        save_state(state)
 
-        # ── ③..N alternating (Flink output topic + schema) → Flink stage ──
+        # ── Segment 2 ×N: input topic → flink stage → output topic ─────────
         for k, name in enumerate(p.flink_names):
             in_topic  = p.topics[k]
             out_topic = p.topics[k + 1]
-
-            stage_num = 3 + 2 * k    # ③, ⑤, ⑦, ...
-            print(f"\n  • Flink output topic for stage {k}")
+            print(f"\n  • <{in_topic}> → [flink {name}] → <{out_topic}>")
+            # Output topic must exist before Flink writes to it.
             create_topic(out_topic, topics)
             if SR_ENDPOINT and SR_KEY and SR_SECRET:
                 sr_register(out_topic, ENRICHED_SCHEMA)
-            save_state(state)
-
-            print(f"\n  • Flink stage {k} ({in_topic} → {out_topic})")
             if name in statements:
                 print(f"     flink ✓ (already exists)")
             else:
                 sql = _flink_sql(k, in_topic, out_topic, rng)
                 if create_flink_statement(name, sql):
                     statements.append(name)
-                    save_state(state)
+            save_state(state)
 
-        # ── tail: consumer ────────────────────────────────────────────────
+        # ── Segment 3: final topic → tail consumer ─────────────────────────
         if p.consumer_group:
-            print(f"\n  ⓩ tail consumer (reads {p.topics[-1]})")
+            print(f"\n  ⓩ <{p.topics[-1]}> → [consumer {p.consumer_group}]")
             consumer_pairs.append((p.consumer_group, p.topics[-1]))
-            print(f"     (deferred — will spawn after all stages are up)")
+            print(f"     consumer (deferred — will spawn after all stages are up)")
 
         print(f"\n  ══ Pipeline {p.domain} build complete ══")
 
