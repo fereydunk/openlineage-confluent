@@ -677,84 +677,120 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     topics: list = state.setdefault("topics", [])
     connectors: dict = state.setdefault("connectors", {})
     statements: list = state.setdefault("flink_statements", [])
+    state.setdefault("producer_pids", [])
 
-    print("\n══ Step 1/7 — Create Kafka topics ══")
-    for p in pipelines:
-        for t in p.topics:
-            create_topic(t, topics)
-    save_state(state)
+    # Build each pipeline strictly left-to-right: every component is created
+    # only after its upstream dependencies exist. The chain for a Datagen
+    # pipeline of N nodes:
+    #
+    #   topic₀ + schema₀
+    #   → Datagen connector → topic₀
+    #   → wait 15s for Datagen to register/produce
+    #   → topic₁ + schema₁
+    #   → Flink₀ (topic₀ → topic₁)
+    #   → topic₂ + schema₂
+    #   → Flink₁ (topic₁ → topic₂)
+    #   → … (repeat for every Flink stage)
+    #   → consumer group on the final topic
+    #
+    # Native-producer pipelines: same chain, but the "head" is a Java client
+    # spawned right after topic₀ + schema₀ are in place.
+    consumer_pairs:  list[tuple[str, str]] = []
+    producer_specs:  list[dict]            = []
+    for i, p in enumerate(pipelines, 1):
+        head_kind = "native-producer-headed" if p.uses_native_producer else "Datagen-headed"
+        print(f"\n══ Pipeline {i}/{len(pipelines)}: {p.domain} "
+              f"({p.total_nodes} nodes, {head_kind}) ══")
+        print("  Building left to right:")
 
-    print("\n══ Step 2/7 — Register schemas for every topic in each chain ══")
-    if not (SR_ENDPOINT and SR_KEY and SR_SECRET):
-        print("  (skipped — env has no Schema Registry credentials in config.yaml)")
-    else:
-        for p in pipelines:
-            # Head topic — RAW_ORDERS_SCHEMA matches both the ORDERS quickstart
-            # (Datagen) and the Java OrderProducer's payload shape.
+        # ── ① head topic + schema ──────────────────────────────────────────
+        print(f"\n  ① head topic")
+        create_topic(p.topics[0], topics)
+        if SR_ENDPOINT and SR_KEY and SR_SECRET:
+            # RAW_ORDERS_SCHEMA matches both the Datagen ORDERS quickstart
+            # AND the Java OrderProducer's GenericRecord shape.
             sr_register(p.topics[0], RAW_ORDERS_SCHEMA)
-            # First Flink output (if any) gets ENRICHED_SCHEMA; later Flink
-            # stages SELECT * so the schema propagates without re-registration,
-            # but we still pre-register to make every topic show up with a
-            # schema in CC's stream lineage from the moment it's created.
-            for k, topic in enumerate(p.topics[1:], start=1):
-                sr_register(topic, ENRICHED_SCHEMA)
-
-    print("\n══ Step 3/7 — Create Datagen connectors (Datagen-headed pipelines) ══")
-    datagen_pipes = [p for p in pipelines if not p.uses_native_producer]
-    if not datagen_pipes:
-        print("  (none — all pipelines use native producers)")
-    for p in datagen_pipes:
-        if p.domain not in connectors:
-            conn_id = create_connector(p.domain, p.topics[0])
-            if conn_id:
-                connectors[p.domain] = conn_id
-    save_state(state)
-
-    print("\n══ Step 4/7 — Waiting 90s for Datagen to register raw AVRO schemas ══")
-    if not datagen_pipes:
-        print("  (skipped — no Datagen connectors to wait on)")
-    else:
-        for remaining in range(90, 0, -15):
-            print(f"  {remaining}s ...", flush=True)
-            time.sleep(15)
-
-    print("\n══ Step 5/7 — Create chained Flink statements ══")
-    for p in pipelines:
-        for k, name in enumerate(p.flink_names):
-            if name in statements:
-                continue
-            in_topic  = p.topics[k]
-            out_topic = p.topics[k + 1]
-            sql = _flink_sql(k, in_topic, out_topic, rng)
-            if create_flink_statement(name, sql):
-                statements.append(name)
-    save_state(state)
-
-    print("\n══ Step 6/7 — Start native Java producers (native-producer-headed pipelines) ══")
-    producer_pipes = [p for p in pipelines if p.uses_native_producer]
-    producer_specs = [{
-        "domain":         p.domain,
-        "topic":          p.topics[0],
-        "client_id":      f"ol-{p.domain}-producer",
-        "job_namespace":  f"kafka-producer://{CLUSTER_ID}",
-        "job_name":       f"ol-{p.domain}-producer",
-    } for p in producer_pipes]
-    if not producer_specs:
-        print("  (none — all pipelines use Datagen)")
-    producer_pids = start_native_producers(producer_specs)
-    if producer_pids:
-        state["producer_pids"] = producer_pids
+        else:
+            print("  (SR not configured — skipping schema registration)")
         save_state(state)
 
-    print("\n══ Step 7/7 — Start consumer groups ══")
-    pairs = [
-        (p.consumer_group, p.topics[-1])
-        for p in pipelines
-        if p.consumer_group is not None
-    ]
-    pids = start_consumers(pairs)
-    if pids:
-        PIDS_FILE.write_text("\n".join(str(p) for p in pids))
+        # ── ② head producer (Datagen connector OR Java producer) ───────────
+        head_label = ("Java producer" if p.uses_native_producer
+                      else "Datagen connector")
+        print(f"\n  ② head producer ({head_label} → {p.topics[0]})")
+        if p.uses_native_producer:
+            # Defer spawning until ALL topics + Flink statements are up — the
+            # Java producer would otherwise see "topic not found" if the
+            # Flink output topic isn't ready when the producer starts.
+            producer_specs.append({
+                "domain":         p.domain,
+                "topic":          p.topics[0],
+                "client_id":      f"ol-{p.domain}-producer",
+                "job_namespace":  f"kafka-producer://{CLUSTER_ID}",
+                "job_name":       f"ol-{p.domain}-producer",
+            })
+            print(f"     (deferred — will spawn after all Flink stages are RUNNING)")
+        else:
+            if p.domain in connectors:
+                print(f"     connector ✓ (already exists, id={connectors[p.domain]})")
+            else:
+                conn_id = create_connector(p.domain, p.topics[0])
+                if conn_id:
+                    connectors[p.domain] = conn_id
+                    save_state(state)
+            # Datagen needs a few seconds to register its writer schema with
+            # SR and start producing. Pre-registered schema in ① means no
+            # auto-register conflict — 15s is enough for the connector to
+            # transition to RUNNING and Flink to find data on the topic.
+            print(f"     ⏳ waiting 15s for Datagen to start producing...")
+            time.sleep(15)
+
+        # ── ③..N alternating (Flink output topic + schema) → Flink stage ──
+        for k, name in enumerate(p.flink_names):
+            in_topic  = p.topics[k]
+            out_topic = p.topics[k + 1]
+
+            stage_num = 3 + 2 * k    # ③, ⑤, ⑦, ...
+            print(f"\n  • Flink output topic for stage {k}")
+            create_topic(out_topic, topics)
+            if SR_ENDPOINT and SR_KEY and SR_SECRET:
+                sr_register(out_topic, ENRICHED_SCHEMA)
+            save_state(state)
+
+            print(f"\n  • Flink stage {k} ({in_topic} → {out_topic})")
+            if name in statements:
+                print(f"     flink ✓ (already exists)")
+            else:
+                sql = _flink_sql(k, in_topic, out_topic, rng)
+                if create_flink_statement(name, sql):
+                    statements.append(name)
+                    save_state(state)
+
+        # ── tail: consumer ────────────────────────────────────────────────
+        if p.consumer_group:
+            print(f"\n  ⓩ tail consumer (reads {p.topics[-1]})")
+            consumer_pairs.append((p.consumer_group, p.topics[-1]))
+            print(f"     (deferred — will spawn after all stages are up)")
+
+        print(f"\n  ══ Pipeline {p.domain} build complete ══")
+
+    # ── Spawn deferred runtime processes (after every topic+Flink is up) ──
+    if producer_specs:
+        print("\n══ Starting deferred native Java producers ══")
+        producer_pids = start_native_producers(producer_specs)
+        if producer_pids:
+            state["producer_pids"] = state.get("producer_pids", []) + producer_pids
+            save_state(state)
+    else:
+        producer_pids = []
+
+    if consumer_pairs:
+        print("\n══ Starting deferred consumer groups ══")
+        pids = start_consumers(consumer_pairs)
+        if pids:
+            PIDS_FILE.write_text("\n".join(str(p) for p in pids))
+    else:
+        pids = []
 
     # ── Per-pipeline chain summary ─────────────────────────────────────────
     # Show every pipeline as a connected directed chain so the user can
