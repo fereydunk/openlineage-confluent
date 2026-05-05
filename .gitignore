@@ -50,3 +50,4 @@ scripts/java_client_demo/dependency-reduced-pom.xml
 scripts/demo_20_state*.json
 scripts/demo_20_consumers*.pids
 scripts/demo_20_consumer_worker.py
+scripts/demo_pipelines_consumer_worker.py
