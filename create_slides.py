@@ -418,18 +418,12 @@ def build_slides():
                "End-to-end lineage stitching four job types into a single directed graph")
 
     topo_nodes = [
-        # (label, color, x, y, w, h)
-        ("Datagen Source Connector", rgb(255, 243, 224), emu(0.7),  emu(3.5), emu(5.5), emu(0.9)),
-        ("ol-raw-orders",            rgb(232, 244, 253), emu(7.0),  emu(3.5), emu(4.0), emu(0.9)),
-        ("Java OrderProducer",       rgb(251, 233, 231), emu(12.0), emu(3.5), emu(4.5), emu(0.9)),
-        ("Flink: ol-orders-enricher",rgb(232, 245, 233), emu(2.5),  emu(5.1), emu(5.5), emu(0.9)),
-        ("ol-orders-enriched",       rgb(232, 244, 253), emu(9.0),  emu(5.1), emu(4.0), emu(0.9)),
-        ("Flink: ol-high-value-alerts",rgb(232,245,233), emu(0.7),  emu(6.7), emu(5.5), emu(0.9)),
-        ("ol-high-value-alerts",     rgb(232, 244, 253), emu(7.2),  emu(6.7), emu(4.0), emu(0.9)),
-        ("Flink: ol-medium-risk-orders",rgb(232,245,233),emu(12.5), emu(6.7), emu(5.5), emu(0.9)),
-        ("ol-medium-risk-orders",    rgb(232, 244, 253), emu(19.0), emu(6.7), emu(4.5), emu(0.9)),
-        ("HTTP Sink Connector",      rgb(255, 243, 224), emu(2.5),  emu(8.3), emu(4.5), emu(0.9)),
-        ("Consumer Group: connect-lcc-*",rgb(243,232,255),emu(12.0),emu(8.3), emu(5.5), emu(0.9)),
+        # (label, color, x, y, w, h) — live env-m2qxq topology, fully bridge-detected
+        ("orders-source",            rgb(255, 243, 224), emu(3.5),  emu(3.5), emu(5.5), emu(0.9)),
+        ("orders-raw",               rgb(232, 244, 253), emu(11.0), emu(3.5), emu(4.0), emu(0.9)),
+        ("Flink: orders-enrich",     rgb(232, 245, 233), emu(6.0),  emu(5.5), emu(5.5), emu(0.9)),
+        ("orders-enriched",          rgb(232, 244, 253), emu(13.5), emu(5.5), emu(4.0), emu(0.9)),
+        ("orders-http-sink",         rgb(255, 243, 224), emu(8.5),  emu(7.5), emu(5.0), emu(0.9)),
     ]
 
     for (lbl, bg_col, x, y, w, h) in topo_nodes:
@@ -439,15 +433,11 @@ def build_slides():
                     font_size=10, bold=True, color=TEXT, v_align="MIDDLE"))
 
     arrows = [
-        ("→", emu(6.25), emu(3.85)),
-        ("←", emu(11.1), emu(3.85)),
-        ("↓", emu(8.8),  emu(4.5)),
-        ("→", emu(8.1),  emu(5.45)),
-        ("↓", emu(10.8), emu(6.1)),
-        ("→", emu(6.25), emu(7.05)),
-        ("→", emu(18.1), emu(7.05)),
-        ("←", emu(6.25), emu(8.65)),
-        ("←", emu(11.1), emu(8.65)),
+        ("→", emu(10.25), emu(3.85)),
+        ("↓", emu(12.75), emu(4.5)),
+        ("→", emu(12.75), emu(5.85)),
+        ("↓", emu(15.25), emu(6.5)),
+        ("←", emu(13.25), emu(7.85)),
     ]
     for i, (sym, ax, ay) in enumerate(arrows):
         add(textbox(oid(f"arr_{i}"), sym, ax, ay, emu(0.7), emu(0.7),
@@ -457,7 +447,6 @@ def build_slides():
         ("Orange = Managed / Self-Managed Connect", rgb(255,243,224)),
         ("Green  = Flink persistent SQL statements", rgb(232,245,233)),
         ("Blue   = Kafka topics (OL datasets)",      rgb(232,244,253)),
-        ("Purple = Consumer groups",                 rgb(243,232,255)),
     ]
     for i, (lbl, col) in enumerate(legend):
         lx = emu(0.7) + i * emu(6.1)

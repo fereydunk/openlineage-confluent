@@ -68,29 +68,29 @@ Then each cycle:
 
 ## Live demo topology (DEVTEST cluster)
 
-The repository includes a **20-domain demo** provisioning script (see [Scripts](#scripts)). The core orders pipeline:
+The DEVTEST environment (`env-m2qxq` / `lkc-1j6rd3`, us-west-2) currently runs a minimal end-to-end orders pipeline. Every node and edge below is detected by the bridge with **zero manual emission** — the Flink statement is picked up via `confluent flink statement list`, the connectors via the Connect REST API, and the topic Datasets via Kafka REST + Schema Registry enrichment.
 
 ```
-[ol-datagen-orders-source]    DatagenSource managed connector
+[orders-source]               DatagenSource managed connector
         │
         ▼
-  ol-raw-orders                Kafka topic
+  orders-raw                   Kafka topic
         │
-        ├──▶ [ol-enrich-orders]          Flink: flatten + add risk_tier
-        │           │
-        │     ol-orders-enriched         Kafka topic
-        │     (SchemaDatasetFacet,        ← field-level schema from SR
-        │      KafkaTopicDatasetFacet,    ← partitions / replication from Kafka REST
-        │      KafkaTopicThroughputFacet) ← bytes/records from Metrics API
-        │           │
-        │    ┌──────┼──────────────────────────────┐
-        │    ▼      ▼                               ▼
-        │  [ol-high-value-alerts]  [ol-medium-risk-orders]  [ol-http-sink]
-        │        (Flink)                 (Flink)           (HttpSink connector)
-        │
-        └──▶ [order-processor-service]   Consumer group (application)
-        └──▶ [CSAS_HIGH_VALUE_STREAM_0]  ksqlDB persistent query
+        ▼
+[orders-enrich]                Flink: INSERT INTO orders-enriched
+        │                              SELECT ..., CASE risk_tier ... FROM orders-raw
+        ▼
+  orders-enriched              Kafka topic
+        │                       (SchemaDatasetFacet         ← field-level schema from SR
+        │                        KafkaTopicDatasetFacet     ← partitions / replication from Kafka REST
+        │                        KafkaTopicThroughputFacet) ← bytes/records from Metrics API
+        ▼
+[orders-http-sink]             HttpSink managed connector
 ```
+
+A second Flink statement, `orders-enriched-ddl`, is also present (CREATE TABLE only, status `COMPLETED` — no lineage edge).
+
+> **Want a richer topology?** The wizard's *Provision demo pipelines* button (card 4) generates N independent multi-stage pipelines drawn from a 20-domain pool — see [Scripts](#scripts). The standalone templates in `scripts/connector-*.json`, `scripts/flink-*.sql`, `scripts/schema-*.avsc`, and `scripts/java_client_demo/` produce a separate aspirational `ol-*` topology if you deploy them by hand.
 
 ## Prerequisites
 
@@ -328,19 +328,18 @@ This demo shows how native Kafka Java producers and consumers appear in the line
 
 ### What you'll see in Marquez
 
+The demo creates its own isolated `ol-*` topology — it does **not** connect to the DEVTEST `orders-*` chain (different topic names by design, so the demo doesn't pollute the live pipeline):
+
 ```
-[order-producer]          java-app://order-service       (emitted directly by the app)
+[order-producer]          kafka-producer://order-service     (emitted directly by the app)
        │
        ▼
   ol-raw-orders            kafka://<bootstrap>
        │
-       ├──▶ [ol-enrich-orders]          Flink (bridge-detected)
-       │           │
-       │     ol-orders-enriched
-       │           ...
-       │
-       └──▶ [ol-java-demo-consumer]    kafka-consumer-group://<cluster_id>  (bridge-detected)
+       └──▶ [ol-java-demo-consumer]    kafka-consumer-group://<cluster_id>  (bridge-detected via Metrics API)
 ```
+
+The producer side is captured by the application calling the `openlineage-java` SDK directly. The consumer side appears automatically on the next bridge poll (~60s + Metrics API ingestion lag).
 
 ### Prerequisites
 

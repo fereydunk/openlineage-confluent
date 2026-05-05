@@ -304,13 +304,11 @@ def s06_topology(prs):
     s = new_slide(prs)
     add_rect(s, 0, 0, SW, SH, LTGRAY)
     slide_header(s, "Live Demo Topology",
-                 "End-to-end lineage stitching four job types into a single directed graph")
+                 "End-to-end lineage in env-m2qxq — every node detected by the bridge, no manual emission")
 
     CTEAL = RGBColor(0xFF, 0xF3, 0xE0)  # connect (orange tint)
     CBLU  = RGBColor(0xE6, 0xF5, 0xFB)  # topic (blue tint)
     CGRN  = RGBColor(0xE6, 0xF5, 0xE9)  # flink (green tint)
-    CRED  = RGBColor(0xFB, 0xE9, 0xE7)  # java producer
-    CPUR  = RGBColor(0xF3, 0xE5, 0xF5)  # consumer group
 
     def tn(label, bg, l, t, w=Inches(2.35), h=Inches(0.44)):
         add_rect(s, l, t, w, h, bg, line_color=RGBColor(0xD8, 0xD8, 0xD8))
@@ -321,33 +319,23 @@ def s06_topology(prs):
         add_textbox(s, sym, l, t, Inches(0.3), Inches(0.35),
                     size=12, color=MDGRAY, align=PP_ALIGN.CENTER)
 
-    tn("Datagen Source Connector", CTEAL, Inches(0.3),  Inches(1.85))
-    tn("ol-raw-orders",            CBLU,  Inches(2.9),  Inches(1.85), w=Inches(1.9))
-    tn("Java OrderProducer",       CRED,  Inches(5.05), Inches(1.85))
-    ar("→", Inches(2.68),  Inches(1.95))
-    ar("←", Inches(4.76),  Inches(1.95))
+    # Linear chain: orders-source → orders-raw → orders-enrich → orders-enriched → orders-http-sink
+    tn("orders-source",  CTEAL, Inches(1.5), Inches(1.95))
+    tn("orders-raw",     CBLU,  Inches(4.4), Inches(1.95), w=Inches(2.0))
+    ar("→", Inches(4.05), Inches(2.05))
 
-    tn("Flink: ol-orders-enricher", CGRN, Inches(1.0), Inches(2.52))
-    tn("ol-orders-enriched",        CBLU, Inches(3.6), Inches(2.52), w=Inches(2.0))
-    ar("↓", Inches(3.75),  Inches(2.35))
-    ar("→", Inches(3.37),  Inches(2.64))
+    ar("↓", Inches(5.25), Inches(2.45))
 
-    tn("Flink: ol-high-value-alerts",   CGRN, Inches(0.3),  Inches(3.2))
-    tn("ol-high-value-alerts",          CBLU, Inches(2.9),  Inches(3.2), w=Inches(1.8))
-    tn("Flink: ol-medium-risk-orders",  CGRN, Inches(5.05), Inches(3.2))
-    tn("ol-medium-risk-orders",         CBLU, Inches(7.65), Inches(3.2), w=Inches(2.0))
-    ar("↓", Inches(4.52),  Inches(2.99))
-    ar("→", Inches(2.68),  Inches(3.32))
-    ar("→", Inches(7.42),  Inches(3.32))
+    tn("Flink: orders-enrich", CGRN, Inches(3.4), Inches(2.85))
+    tn("orders-enriched",      CBLU, Inches(6.3), Inches(2.85), w=Inches(2.0))
+    ar("→", Inches(5.95), Inches(2.95))
 
-    tn("HTTP Sink Connector",           CTEAL, Inches(1.0),  Inches(3.88))
-    tn("Consumer Group: connect-lcc-*", CPUR,  Inches(4.3),  Inches(3.88), w=Inches(2.7))
-    ar("←", Inches(3.37),  Inches(4.0))
-    ar("←", Inches(4.05),  Inches(4.0))
-    ar("↑", Inches(4.85),  Inches(3.68))
+    ar("↓", Inches(7.15), Inches(3.35))
+
+    tn("orders-http-sink", CTEAL, Inches(6.0), Inches(3.75), w=Inches(2.5))
 
     add_textbox(s,
-        "Orange = Connect    Blue = Kafka Topic    Green = Flink    Purple = Consumer Group    Red = Java Producer",
+        "Orange = Connect    Blue = Kafka Topic    Green = Flink",
         Inches(0.3), Inches(4.64), Inches(9.4), Inches(0.35),
         size=8, color=MDGRAY, italic=True)
 

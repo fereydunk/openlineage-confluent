@@ -340,36 +340,45 @@ with self._lock:
 
 ## Data flow example
 
-Given the demo topology:
+The DEVTEST environment (`env-m2qxq` / `lkc-1j6rd3`) runs this topology — all detected by the bridge with zero manual emission:
 
 ```
-ol-datagen-orders-source  →  ol-raw-orders
-ol-enrich-orders          :  ol-raw-orders → ol-orders-enriched
-ol-high-value-alerts      :  ol-orders-enriched → ol-high-value-alerts
-ol-http-sink              ←  ol-orders-enriched
-order-processor-service   ←  ol-orders-enriched  (consumer group)
-CSAS_HIGH_VALUE_STREAM_0  :  ol-orders-enriched → HIGH_VALUE_STREAM  (ksqlDB)
+orders-source        →  orders-raw                         (DatagenSource managed connector)
+orders-enrich        :  orders-raw → orders-enriched       (Flink: INSERT ... SELECT ... CASE risk_tier)
+orders-http-sink     ←  orders-enriched                    (HttpSink managed connector)
 ```
 
-The bridge emits 6 `RunEvent`s per cycle (one per job):
+A second Flink statement, `orders-enriched-ddl`, exists as a CREATE TABLE (status COMPLETED, no lineage edge).
+
+The bridge emits 3 `RunEvent`s per cycle (one per job):
 
 ```json
-// Consumer group (inputs only — correct for a pure consumer)
+// Source connector
 {
   "eventType": "COMPLETE",
-  "job": {"namespace": "kafka-consumer-group://lkc-1j6rd3", "name": "order-processor-service"},
-  "inputs":  [{"namespace": "kafka://pkc-…:9092", "name": "ol-orders-enriched"}],
-  "outputs": null
+  "job": {"namespace": "kafka-connect://env-m2qxq", "name": "orders-source"},
+  "inputs":  [],
+  "outputs": [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-raw"}]
 }
 
-// ksqlDB query
+// Flink statement
 {
   "eventType": "COMPLETE",
-  "job": {"namespace": "ksqldb://lksqlc-xxxxx", "name": "CSAS_HIGH_VALUE_STREAM_0"},
-  "inputs":  [{"namespace": "kafka://pkc-…:9092", "name": "ol-orders-enriched"}],
-  "outputs": [{"namespace": "kafka://pkc-…:9092", "name": "HIGH_VALUE_STREAM"}]
+  "job": {"namespace": "flink://env-m2qxq", "name": "orders-enrich"},
+  "inputs":  [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-raw"}],
+  "outputs": [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-enriched"}]
+}
+
+// Sink connector
+{
+  "eventType": "COMPLETE",
+  "job": {"namespace": "kafka-connect://env-m2qxq", "name": "orders-http-sink"},
+  "inputs":  [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-enriched"}],
+  "outputs": []
 }
 ```
+
+If consumer groups, ksqlDB clusters, or Tableflow syncs are added later, additional events appear automatically — no code changes required. See the namespace conventions table earlier in this doc for the shape of those events.
 
 ---
 
