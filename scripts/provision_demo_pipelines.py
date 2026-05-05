@@ -59,9 +59,22 @@ FLINK_REGION:    str = ""    # parsed from kafka_bootstrap, e.g. "us-east-2"
 SR_ENDPOINT:     str = ""
 SR_KEY:          str = ""
 SR_SECRET:       str = ""
+SR_REGION:       str = ""    # parsed from SR endpoint host, e.g. "us-east-2"
 KAFKA_BOOTSTRAP: str = ""
 KAFKA_API_KEY:   str = ""
 KAFKA_API_SECRET: str = ""
+
+# Single schema serialization format used everywhere — keep producer payload,
+# pre-registered topic schemas, and Flink's deserializer all on the same page.
+# Changing this requires updating OrderProducer.java's serializer too.
+SCHEMA_TYPE: str = "AVRO"
+
+
+def _region_label() -> str:
+    """Short '<cloud>/<region>' tag used in component-creation log lines so
+    every ✓ shows where the resource lives. Falls back to '?' if either is
+    unknown (only happens before _load_env_creds runs)."""
+    return f"{FLINK_CLOUD or '?'}/{FLINK_REGION or '?'}"
 
 # Per-env state file paths (set in main() so multi-env doesn't clobber)
 STATE_FILE: Path = SCRIPT_DIR / "demo_pipelines_state.json"
@@ -89,7 +102,7 @@ def _parse_cloud_region(bootstrap: str) -> tuple[str, str]:
 
 def _load_env_creds(config_path: Path, env_id: str) -> None:
     global ENV_ID, CLUSTER_ID, FLINK_POOL, FLINK_CLOUD, FLINK_REGION
-    global SR_ENDPOINT, SR_KEY, SR_SECRET
+    global SR_ENDPOINT, SR_KEY, SR_SECRET, SR_REGION
     global KAFKA_BOOTSTRAP, KAFKA_API_KEY, KAFKA_API_SECRET
     global STATE_FILE, PIDS_FILE
 
@@ -115,6 +128,10 @@ def _load_env_creds(config_path: Path, env_id: str) -> None:
         SR_ENDPOINT = env.schema_registry.endpoint
         SR_KEY      = env.schema_registry.api_key
         SR_SECRET   = env.schema_registry.api_secret.get_secret_value()
+        # SR endpoint host has the same shape as Kafka bootstrap:
+        # psrc-XXXXXX.<region>.<cloud>.confluent.cloud — reuse the parser.
+        sr_host = SR_ENDPOINT.replace("https://", "").replace("http://", "")
+        _, SR_REGION = _parse_cloud_region(sr_host + ":443")
 
     if not (CLUSTER_ID and KAFKA_API_KEY and KAFKA_API_SECRET):
         sys.exit(
@@ -126,6 +143,38 @@ def _load_env_creds(config_path: Path, env_id: str) -> None:
             f"WARNING: env '{env_id}' has no flink_compute_pool set; "
             f"Flink statements cannot be created. Set EnvDeployment.flink_compute_pool."
         )
+
+    # Same-region check across every component. Catches the historical
+    # misalignment bug where the wizard created a Flink pool in us-west-2
+    # against a us-east-2 Kafka cluster — Flink couldn't read the cluster's
+    # topics. Now also catches Schema Registry in a different region from
+    # the cluster (would force cross-region SR lookups on every produce).
+    print(f"\n══ Region alignment check ══")
+    print(f"  Kafka cluster ({CLUSTER_ID})  : {FLINK_CLOUD or '?'}/{FLINK_REGION or '?'}")
+    if SR_ENDPOINT:
+        same = SR_REGION == FLINK_REGION and SR_REGION
+        marker = "✓" if same else "⚠"
+        print(f"  Schema Registry           : {FLINK_CLOUD or '?'}/{SR_REGION or '?'}  {marker}")
+        if not same and SR_REGION:
+            print(f"  ⚠ SR region differs from cluster region — every produce/fetch crosses regions.")
+            print(f"    Recommend: enable SR in the cluster's region via the Cloud UI.")
+    else:
+        print(f"  Schema Registry           : (not configured) ⚠")
+    if FLINK_POOL:
+        print(f"  Flink compute pool ({FLINK_POOL}): inspecting…")
+        # Pool region is queried lazily by _flink_region_args(); call it now
+        # to surface mismatches early.
+        pool_args = _flink_region_args()
+        if len(pool_args) == 4:
+            pool_cloud, pool_region = pool_args[1], pool_args[3]
+            same_pool = pool_cloud == FLINK_CLOUD and pool_region == FLINK_REGION
+            marker = "✓" if same_pool else "⚠"
+            print(f"  Flink compute pool        : {pool_cloud}/{pool_region}  {marker}")
+            if not same_pool:
+                print(f"  ⚠ Flink pool region differs from cluster — Flink can't read this cluster's topics.")
+                print(f"    Recommend: delete this pool and re-provision so the wizard creates one in the cluster's region.")
+    print(f"  Schema serialization      : {SCHEMA_TYPE}")
+    print()
 
     # Per-env state files keep parallel envs from clobbering each other. Filename
     # kept stable across script renames so older provisioned envs can still
@@ -349,7 +398,7 @@ def sr_register(topic: str, schema: str) -> bool:
         r = httpx.post(url, json={"schema": schema, "schemaType": "AVRO"},
                        auth=(SR_KEY, SR_SECRET), timeout=30)
         if r.status_code in (200, 201):
-            print(f"  SR ✓ {subject} (id={r.json().get('id')})")
+            print(f"  SR ✓ {subject} ({SCHEMA_TYPE}, id={r.json().get('id')})")
             return True
         print(f"  SR ✗ {subject}: {r.status_code} {r.text[:120]}")
         return False
@@ -375,7 +424,7 @@ def create_topic(topic: str, state_topics: list) -> bool:
              "--partitions", "6", "--cluster", CLUSTER_ID, "--environment", ENV_ID])
     combined = (r.stdout + r.stderr).lower()
     if ok(r) or "already exists" in combined:
-        print(f"  topic ✓ {topic}")
+        print(f"  topic ✓ {topic} ({_region_label()})")
         state_topics.append(topic)
         return True
     print(f"  topic ✗ {topic}: {r.stderr.strip()[:120]}")
@@ -405,7 +454,7 @@ def create_connector(domain: str, output_topic: str) -> str | None:
         os.unlink(tmp)
         if ok(r):
             conn_id = json.loads(r.stdout).get("id", "")
-            print(f"  connector ✓ {name} ({conn_id})")
+            print(f"  connector ✓ {name} ({_region_label()}, {SCHEMA_TYPE}, {conn_id})")
             return conn_id
         print(f"  connector ✗ {name}: {r.stderr.strip()[:120]}")
         return None
@@ -439,7 +488,7 @@ def create_flink_statement(name: str, sql: str) -> bool:
                  "--environment",  ENV_ID,
                  "--wait"])
         if ok(r):
-            print(f"  flink ✓ {name}")
+            print(f"  flink ✓ {name} ({_region_label()}, pool={FLINK_POOL})")
             return True
         # Trim noisy boilerplate; the useful bit is usually after "Caused by"
         err = (r.stderr or r.stdout or "").strip()
@@ -511,7 +560,7 @@ def start_consumers(group_topic_pairs: list[tuple[str, str]]) -> list[int]:
             env=env, stdout=log_fh, stderr=subprocess.STDOUT,
         )
         pids.append(proc.pid)
-        print(f"  consumer ✓ {group} → {topic} (pid={proc.pid}, log={log_path.name})")
+        print(f"  consumer ✓ {group} → {topic} ({_region_label()}, pid={proc.pid}, log={log_path.name})")
     return pids
 
 
@@ -602,7 +651,7 @@ def start_native_producers(producer_specs: list[dict]) -> list[int]:
             env=env, stdout=log_fh, stderr=subprocess.STDOUT,
         )
         pids.append(proc.pid)
-        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} (pid={proc.pid}, log={log_path.name})")
+        print(f"  producer ✓ {spec['client_id']} → {spec['topic']} ({_region_label()}, {SCHEMA_TYPE}, pid={proc.pid}, log={log_path.name})")
     return pids
 
 
@@ -707,9 +756,33 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     if pids:
         PIDS_FILE.write_text("\n".join(str(p) for p in pids))
 
-    print(f"""
-══ Provisioning complete ══
+    # ── Per-pipeline chain summary ─────────────────────────────────────────
+    # Show every pipeline as a connected directed chain so the user can
+    # visually confirm start→end connectivity matches what they expect.
+    # Each box is annotated with region + schema type (where applicable),
+    # mirroring CC's own stream lineage view but rendered in plain text.
+    print("\n══ Pipeline chains ══")
+    for p in pipelines:
+        head_label = (f"producer {f'ol-{p.domain}-producer'}" if p.uses_native_producer
+                      else f"connector {f'ol-{p.domain}-datagen'}")
+        head_anno  = f"{_region_label()}, {SCHEMA_TYPE}"
+        chain: list[str] = [f"[{head_label}] ({head_anno})"]
+        for k, topic in enumerate(p.topics):
+            chain.append(f"<{topic}> ({_region_label()}, {SCHEMA_TYPE})")
+            if k < len(p.flink_names):
+                chain.append(f"[flink {p.flink_names[k]}] ({_region_label()}, pool={FLINK_POOL})")
+        if p.ends_with_consumer and p.consumer_group:
+            chain.append(f"[consumer {p.consumer_group}] ({_region_label()})")
+        print(f"  Pipeline {p.domain} ({p.total_nodes} nodes):")
+        for i, node in enumerate(chain):
+            arrow = "    " if i == 0 else "  → "
+            print(f"  {arrow}{node}")
+        print()
+
+    print(f"""══ Provisioning complete ══
   Pipelines           : {len(pipelines)}
+  Region              : {_region_label()}
+  Schema type         : {SCHEMA_TYPE}
   Topics              : {len(topics)}
   Datagen connectors  : {len(connectors)}/{n_datagen}
   Native producers    : {len(producer_pids)}/{n_producer}
