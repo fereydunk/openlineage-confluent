@@ -1,4 +1,4 @@
-.PHONY: install test lint type-check marquez-up marquez-down marquez-logs validate run-once run \
+.PHONY: install test lint type-check marquez-up marquez-down marquez-wipe marquez-logs validate run-once run \
         java-demo-build java-demo-produce java-demo-consume \
         spark-run \
         e2e-aws-setup e2e-tableflow-setup e2e-run
@@ -37,6 +37,12 @@ marquez-up:
 
 marquez-down:
 	$(COMPOSE) down
+
+# Drops the postgres volume (wipes every namespace/dataset/job/run) then brings
+# the stack back up. Use to start lineage from scratch — irreversible.
+marquez-wipe:
+	$(COMPOSE) down -v
+	$(COMPOSE) up -d
 
 marquez-logs:
 	$(COMPOSE) logs -f marquez-api

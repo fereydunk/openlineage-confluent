@@ -18,7 +18,7 @@ Endpoints:
   GET  /bridge/stream    — SSE log of bridge provisioning + ol-confluent run
   POST /cc-login         — {email, password} → `confluent login --save`
   POST /envs/select      — [{env_id, env_name}] → writes confluent.selected_envs
-  POST /marquez/{up,down} — docker compose up/down + patched UI dev server
+  POST /marquez/{up,down,wipe} — docker compose up/down (or down -v + up -d for wipe) + patched UI dev server
   POST /loadtest/{start,stop,teardown} — provision-demo-pipelines worker
   POST /bridge/{start,stop} — `ol-confluent run` worker (provisions pending
                               envs first, then spawns long-lived subprocess)
@@ -589,37 +589,41 @@ def _patched_ui_stop() -> tuple[bool, str]:
 
 
 def _marquez_action(action: str) -> tuple[int, str]:
-    """Bring the FULL Marquez stack up or down.
+    """Bring the FULL Marquez stack up, down, or wipe-and-restart.
 
-    up:   docker compose up (postgres + marquez-api + upstream UI)
-          + `npm run dev` for the patched UI on :1337 (best-effort)
-    down: docker compose down + kill the patched UI dev server
+    up:    docker compose up (postgres + marquez-api + upstream UI)
+           + `npm run dev` for the patched UI on :1337 (best-effort)
+    down:  docker compose down + kill the patched UI dev server
+    wipe:  docker compose down -v + up -d (drops the postgres volume —
+           every namespace/dataset/job/run is gone) + bounce the patched UI
     """
-    if action not in ("up", "down"):
+    if action not in ("up", "down", "wipe"):
         return 2, f"unknown action: {action}"
-    target = "marquez-up" if action == "up" else "marquez-down"
+    target = {"up": "marquez-up", "down": "marquez-down", "wipe": "marquez-wipe"}[action]
     parts: list[str] = []
 
     try:
         proc = subprocess.run(
             ["make", target],
             cwd=str(REPO_DIR),
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=180,
         )
     except FileNotFoundError:
         return 127, "`make` not found in PATH"
     except subprocess.TimeoutExpired:
-        return 124, f"make {target} timed out (>120s)"
+        return 124, f"make {target} timed out (>180s)"
     parts.append((proc.stdout + proc.stderr).strip())
     if proc.returncode != 0:
         return proc.returncode, "\n".join(parts)
 
     # Patched UI — best-effort: don't fail the whole action if it can't start
-    if action == "up":
-        ok, msg = _patched_ui_start()
-        parts.append(f"[patched UI] {msg}")
-    else:
+    if action == "down":
         ok, msg = _patched_ui_stop()
+        parts.append(f"[patched UI] {msg}")
+    else:    # "up" or "wipe": bounce/start the dev server
+        if action == "wipe":
+            _patched_ui_stop()
+        ok, msg = _patched_ui_start()
         parts.append(f"[patched UI] {msg}")
 
     return 0, "\n".join(parts)
@@ -1411,6 +1415,7 @@ PAGE = """<!doctype html>
     <div class="btn-row">
       <button id="mq-up-btn"      onclick="mqAction('up')">Start Marquez</button>
       <button id="mq-down-btn"    onclick="mqAction('down')" class="danger">Stop</button>
+      <button id="mq-wipe-btn"    onclick="mqWipe()"        class="danger">Delete all data</button>
       <button id="mq-refresh-btn" onclick="mqRefresh()" class="secondary">Refresh</button>
       <a class="btn-link" href="http://localhost:1337" target="_blank">Open Marquez UI ↗</a>
     </div>
@@ -1758,7 +1763,8 @@ async function mqAction(action) {
   const stat = document.getElementById('mq-status');
   const btnU = document.getElementById('mq-up-btn');
   const btnD = document.getElementById('mq-down-btn');
-  btnU.disabled = btnD.disabled = true;
+  const btnW = document.getElementById('mq-wipe-btn');
+  btnU.disabled = btnD.disabled = btnW.disabled = true;
   stat.innerHTML = '<span class="dim">running make marquez-' + action + ' …</span>';
   try {
     const r = await fetch('/marquez/' + action, {method:'POST'});
@@ -1775,8 +1781,18 @@ async function mqAction(action) {
   } catch (e) {
     stat.innerHTML = '<span class="err">✗ ' + e.message + '</span>';
   } finally {
-    btnU.disabled = btnD.disabled = false;
+    btnU.disabled = btnD.disabled = btnW.disabled = false;
   }
+}
+
+async function mqWipe() {
+  if (!confirm('Delete ALL Marquez data?\\n\\n' +
+               '  • Drops the postgres volume\\n' +
+               '  • Every namespace, dataset, job, and run is gone\\n' +
+               '  • Marquez restarts empty — perfect for a clean run\\n\\n' +
+               'The bridge MUST be stopped first (the server will refuse otherwise).\\n\\n' +
+               'This cannot be undone.')) return;
+  await mqAction('wipe');
 }
 
 // ── Bridge control (ol-confluent run) ───────────────────────────────────────
@@ -2168,8 +2184,16 @@ class Handler(BaseHTTPRequestHandler):
 
             self._send_json(200, {"results": results})
 
-        elif path in ("/marquez/up", "/marquez/down"):
-            action = "up" if path.endswith("/up") else "down"
+        elif path in ("/marquez/up", "/marquez/down", "/marquez/wipe"):
+            action = path.rsplit("/", 1)[1]
+            # Wiping while the bridge is polling guarantees a flood of
+            # connection errors (and possibly partial re-emission against the
+            # fresh DB before the user expects it). Refuse and tell the user.
+            if action == "wipe" and _bridge_running():
+                self._send_json(409, {"error":
+                    "Bridge is currently running — Stop OpenLineage first, "
+                    "then wipe Marquez."})
+                return
             rc, out = _marquez_action(action)
             if rc != 0:
                 # Tail of output is usually the relevant error
