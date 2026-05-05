@@ -1498,7 +1498,7 @@ PAGE = """<!doctype html>
       lineage sync like any other workload.
     </div>
     <div class="form-grid">
-      <div class="field-pair">
+      <div class="field-pair" style="grid-column: 1 / -1;">
         <label>Target environment</label>
         <select id="lt-env" style="width:100%; background:#0d1117; border:1px solid #30363d;
                                    border-radius:4px; color:#c9d1d9; padding:.45rem .6rem;
