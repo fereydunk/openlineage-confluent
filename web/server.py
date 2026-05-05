@@ -1594,12 +1594,16 @@ PAGE = """<!doctype html>
     font-size: .85rem; color: #3fb950;
   }
 
-  /* ── Logs (load test) ──────────────────────────────── */
+  /* ── Logs (load test, bridge) ────────────────────────── */
   pre.log {
     background: #010409; border: 1px solid #21262d; border-radius: 4px;
-    padding: .65rem .8rem; margin-top: .8rem; height: 260px; overflow-y: auto;
+    padding: .65rem .8rem; margin-top: .8rem;
+    height: min(60vh, 520px); overflow-y: auto;
     font-family: 'SFMono-Regular', Consolas, monospace; font-size: .73rem;
     color: #c9d1d9; white-space: pre-wrap; word-break: break-all;
+    /* Stable scrollbar gutter so the "I'm at the bottom?" check below
+       isn't fooled by scrollbar widening as content grows. */
+    scrollbar-gutter: stable;
   }
 
   .hidden { display: none !important; }
@@ -2056,13 +2060,22 @@ async function bridgeStop() {
                    (r.ok ? '✓ ' : '✗ ') + (d.msg || d.error) + '</span>';
 }
 
+// Stick-to-bottom helper: only auto-scroll if the user is already AT the
+// bottom (within 24px). If they've scrolled up to read history, don't yank
+// them back when new lines arrive. Returns a function you call AFTER
+// appending the new content.
+function appendAndStickToBottom(log, line) {
+  const wasAtBottom = (log.scrollHeight - log.scrollTop - log.clientHeight) < 24;
+  log.textContent += line + '\\n';
+  if (wasAtBottom) log.scrollTop = log.scrollHeight;
+}
+
 function bridgeOpenStream() {
   if (bridgeStream) bridgeStream.close();
   const log = document.getElementById('bridge-log');
   bridgeStream = new EventSource('/bridge/stream');
   bridgeStream.addEventListener('line', e => {
-    log.textContent += JSON.parse(e.data) + '\\n';
-    log.scrollTop = log.scrollHeight;
+    appendAndStickToBottom(log, JSON.parse(e.data));
   });
   bridgeStream.addEventListener('done', e => {
     const d = JSON.parse(e.data);
@@ -2162,8 +2175,7 @@ function ltOpenStream() {
   const log = document.getElementById('lt-log');
   ltStream = new EventSource('/loadtest/stream');
   ltStream.addEventListener('line', e => {
-    log.textContent += JSON.parse(e.data) + '\\n';
-    log.scrollTop = log.scrollHeight;
+    appendAndStickToBottom(log, JSON.parse(e.data));
   });
   ltStream.addEventListener('done', e => {
     const d = JSON.parse(e.data);
