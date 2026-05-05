@@ -396,8 +396,12 @@ def test_teardown_runs_phase_2_sweep_when_state_file_missing(provdemo_module, tm
     monkeypatch.setattr(provdemo_module, "CLUSTER_ID", "lkc-test")
     monkeypatch.setattr(provdemo_module, "SR_ENDPOINT", "")    # skip SR sweep
 
-    monkeypatch.setattr(provdemo_module, "_list_env_flink_statements",
-                        lambda: ["ol-orders00-enrich-0", "user-real-query"])
+    # Phase 2 sweep iterates _all_flink_regions_to_sweep() and lists statements
+    # per region; stub both to one fake region with two statements.
+    monkeypatch.setattr(provdemo_module, "_all_flink_regions_to_sweep",
+                        lambda: [("aws", "us-east-2")])
+    monkeypatch.setattr(provdemo_module, "_list_env_flink_statements_in_region",
+                        lambda c, r: ["ol-orders00-enrich-0", "user-real-query"])
     monkeypatch.setattr(provdemo_module, "_list_env_connectors",
                         lambda: [("ol-orders00-datagen", "lcc-1"), ("user-jdbc", "lcc-2")])
     monkeypatch.setattr(provdemo_module, "_list_env_topics",

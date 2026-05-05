@@ -682,6 +682,55 @@ def _is_demo_name(name: str) -> bool:
 _FLINK_POOL_REGION_CACHE: tuple[str, str] | None = None
 
 
+def _all_flink_regions_to_sweep() -> list[tuple[str, str]]:
+    """Cloud/region pairs that may contain orphan Flink statements for this env.
+
+    Includes the configured pool's region, the cluster's region (in case the
+    pool was deleted), and the regions of any other pools currently in the
+    env (catches cross-region orphans from misaligned-pool history). Sorted
+    + deduped so the sweep visits each region exactly once.
+    """
+    regions: set[tuple[str, str]] = set()
+    # Pool's region (cached after first describe)
+    pool_args = _flink_region_args()
+    if len(pool_args) == 4:
+        regions.add((pool_args[1], pool_args[3]))
+    # Cluster's region (parsed from kafka_bootstrap)
+    if FLINK_CLOUD and FLINK_REGION:
+        regions.add((FLINK_CLOUD, FLINK_REGION))
+    # Every existing pool's region
+    r = subprocess.run(
+        ["confluent", "flink", "compute-pool", "list",
+         "--environment", ENV_ID, "-o", "json"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if r.returncode == 0:
+        try:
+            for pool in json.loads(r.stdout):
+                cloud  = (pool.get("cloud")  or "").lower()
+                region = (pool.get("region") or "").lower()
+                if cloud and region:
+                    regions.add((cloud, region))
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return sorted(regions)
+
+
+def _list_env_flink_statements_in_region(cloud: str, region: str) -> list[str]:
+    """Return all Flink statement names in the given cloud+region, or [] on error."""
+    r = subprocess.run(
+        ["confluent", "flink", "statement", "list",
+         "--environment", ENV_ID, "--cloud", cloud, "--region", region, "-o", "json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        return [s.get("name", "") for s in json.loads(r.stdout) if s.get("name")]
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _flink_region_args() -> list[str]:
     """Cloud/region flags required by `confluent flink statement` commands.
 
@@ -820,10 +869,18 @@ def teardown() -> None:
     print("\n══ Phase 1/2 — State-tracked cleanup ══")
 
     print("\n  Flink statements:")
+    sweep_regions = _all_flink_regions_to_sweep()
     for stmt in state.get("flink_statements", []):
-        r = run(["confluent", "flink", "statement", "delete", stmt,
-                 "--environment", ENV_ID, *_flink_region_args(), "--force"])
-        print(f"    {'✓' if ok(r) else '✗'} {stmt}")
+        # Try every known region — Flink statements live in their pool's region,
+        # which may not match the cluster's. Stop on first success.
+        deleted = False
+        for cloud, region in sweep_regions:
+            r = run(["confluent", "flink", "statement", "delete", stmt,
+                     "--environment", ENV_ID, "--cloud", cloud, "--region", region, "--force"])
+            if ok(r):
+                deleted = True
+                break
+        print(f"    {'✓' if deleted else '✗'} {stmt}")
 
     print("\n  Connectors:")
     for domain, conn_id in state.get("connectors", {}).items():
@@ -840,14 +897,15 @@ def teardown() -> None:
     # ── Phase 2: stateless sweep (catches orphans) ──────────────────────────
     print("\n══ Phase 2/2 — Stateless sweep (purging any remaining ol-* resources) ══")
 
-    print("\n  Orphaned Flink statements:")
+    print("\n  Orphaned Flink statements (across all regions with pools):")
     swept = 0
-    for stmt in _list_env_flink_statements():
-        if _is_demo_name(stmt):
-            r = run(["confluent", "flink", "statement", "delete", stmt,
-                     "--environment", ENV_ID, *_flink_region_args(), "--force"])
-            print(f"    {'✓' if ok(r) else '✗'} {stmt}")
-            swept += 1
+    for cloud, region in sweep_regions:
+        for stmt in _list_env_flink_statements_in_region(cloud, region):
+            if _is_demo_name(stmt):
+                r = run(["confluent", "flink", "statement", "delete", stmt,
+                         "--environment", ENV_ID, "--cloud", cloud, "--region", region, "--force"])
+                print(f"    {'✓' if ok(r) else '✗'} {stmt} ({cloud}/{region})")
+                swept += 1
     if swept == 0:
         print("    (none)")
 
