@@ -66,6 +66,22 @@ Then each cycle:
 | ksqlDB query | `ksqldb://<ksql_cluster_id>` | `<query_id>` | `kafka://<bootstrap>` |
 | Tableflow | `tableflow://<env_id>` | `<topic_name>` | `glue://<region>` |
 
+## Facets emitted on every event
+
+Each `RunEvent` carries typed facets so Marquez consumers can filter / group
+without parsing the namespace URI:
+
+| Facet | Attached to | Source | Purpose |
+|---|---|---|---|
+| `jobType` | every job | hardcoded per source | `(processingType, integration, jobType)` — e.g. `STREAMING/KAFKA_CONNECT/SOURCE_CONNECTOR` |
+| `confluent` | every per-env job + Kafka topic dataset | `LineageEdge.{env_id, cluster_id, cloud, region}` | Confluent topology context: env, cluster, cloud, region — lets you query "every job in env-X" or "every dataset in us-east-2" |
+| `schema` | Kafka topic dataset (when SR configured) | `confluent/schema_registry_client.py` — `/subjects/{topic}-key|value/versions/latest` | Field-level AVRO / JSON Schema / Protobuf schema |
+| `kafkaTopic` | Kafka topic dataset (when Kafka REST configured) | `confluent/kafka_rest_client.py` — `GET /kafka/v3/clusters/{id}/topics` | Partition count, replication factor, isInternal |
+| `kafkaThroughput` | Kafka topic dataset | Metrics API — `received_bytes`/`sent_bytes`/`received_records`/`sent_records` | Topic-level throughput totals over the lookback window |
+
+The `confluent` facet is **omitted** for globally-scoped jobs (ksqlDB clusters,
+self-managed Connect) since they don't belong to any one CC env/cluster.
+
 ## Live demo topology (DEVTEST cluster)
 
 The DEVTEST environment (`env-m2qxq` / `lkc-1j6rd3`, us-west-2) currently runs a minimal end-to-end orders pipeline. Every node and edge below is detected by the bridge with **zero manual emission** — the Flink statement is picked up via `confluent flink statement list`, the connectors via the Connect REST API, and the topic Datasets via Kafka REST + Schema Registry enrichment.
@@ -112,7 +128,14 @@ pip install -e ".[dev]"
 
 ### 2. Configure
 
-The recommended path is to use the wizard — `./startup.sh` launches it at `http://localhost:8892`. Sign in to Confluent Cloud, multi-select environments, click *Save selection*, then *Start OpenLineage*. The wizard mints all per-env API keys and writes `config.yaml` for you.
+The recommended path is to use the wizard — `./startup.sh` launches it at `http://localhost:8892`. Sign in to Confluent Cloud as an OrganizationAdmin (the wizard mints a fresh Cloud API key under your account on every login, inheriting your roles automatically — no manual permission setup needed). Multi-select environments, then click *Start OpenLineage*. The wizard handles all per-env provisioning:
+
+1. **SR-anchored region selection**. Describes Schema Registry first; SR's region becomes the canonical region for everything else. Without alignment, Flink can't read the cluster's topics ("Table does not exist") and producers cross regions on every SR lookup.
+2. **Kafka cluster** in the SR region — reuses if one already aligns, refuses misaligned clusters and creates a fresh one in the anchor region.
+3. **Schema Registry API key** — minted under the logged-in user.
+4. **Flink compute pool** in the SR region — same alignment logic as the cluster.
+
+Each provisioned demo pipeline is built strictly **left-to-right** with explicit dependency ordering: head topic → schema → head producer (Datagen connector OR native Java producer) → wait for schema confirmation → (Flink output topic + schema + Flink statement)\* → tail consumer. Every component creation logs its region and schema type for traceability.
 
 If you prefer hand-editing:
 
@@ -125,7 +148,7 @@ Minimum required fields:
 
 | Field | Where to find it |
 |---|---|
-| `confluent.CONFLUENT_CLOUD_API_KEY` | Confluent Cloud → API Keys → Cloud resource management. **The key's owner principal must have MetricsViewer + CloudClusterAdmin (or env-level Connect access)** — API keys carry their owner's perms; without these you'll get 401 storms in the bridge log. |
+| `confluent.CONFLUENT_CLOUD_API_KEY` | Confluent Cloud → API Keys → Cloud resource management. The wizard auto-mints this on login under your user account; only set manually if you're skipping the wizard. The key's owner principal must have MetricsViewer + CloudClusterAdmin (or env-level Connect access) — OrganizationAdmin inherits both. |
 | `confluent.environments[].env_id` | Confluent Cloud → Environments |
 | `confluent.environments[].cluster_id` | Confluent Cloud → Cluster settings |
 | `confluent.environments[].kafka_bootstrap` | Confluent Cloud → Cluster settings → Bootstrap servers |
@@ -293,7 +316,7 @@ State is persisted in SQLite so removal detection works across process restarts.
 ## Development
 
 ```bash
-make test        # 229 tests, all offline — no credentials required
+make test        # 237 tests, all offline — no credentials required
 make lint        # ruff
 make type-check  # mypy
 ```
@@ -302,9 +325,9 @@ make type-check  # mypy
 
 | File | Purpose |
 |---|---|
-| `provision_demo_pipelines.py` | Provisions `--num-pipelines N` demo pipelines of random length in `[2, --max-nodes M]` (Datagen → optional chained Flink statements → optional consumer group) for testing. The wizard's *Provision demo pipelines* button shells out to this. `--teardown` does a two-phase delete: state-tracked first, then a stateless sweep that lists all `ol-*` resources in the env and deletes them. `--status` shows what's currently provisioned. Requires `pip install confluent-kafka`. |
+| `provision_demo_pipelines.py` | Provisions `--num-pipelines N` demo pipelines of `--min-nodes` to `--max-nodes` length (3, 5, 7, … always odd). Each pipeline is fully connected end-to-end and built strictly left-to-right: head topic → schema → head producer (50/50 random: Datagen connector OR native Java OrderProducer writing Avro) → wait → (Flink output topic + schema + Flink stage)\* → tail consumer. The wizard's *Provision demo pipelines* button shells out to this. `--teardown` does a three-phase delete: state-tracked, then stateless sweep of all `ol-*` resources, then nuke remaining non-system topics. Sweeps Flink statements across **all known regions** so cross-region orphans get caught. `--status` shows what's currently provisioned. `confluent-kafka` is auto-installed via the project's `pip install -e ".[dev]"`. |
 | `producer_consumer_demo.py` | Produces and consumes messages using a named consumer group — use to verify Metrics API consumer lineage detection |
-| `java_client_demo/` | Java Maven project showing end-to-end lineage for native Kafka Java clients. `OrderProducer` emits OpenLineage START/COMPLETE events directly to Marquez (the only way to capture producer identity); `OrderConsumer` uses group `ol-java-demo-consumer`, which the bridge detects via the Metrics API automatically. See [Java client demo](#java-client-end-to-end-demo). |
+| `java_client_demo/` | Java Maven project showing end-to-end lineage for native Kafka Java clients. `OrderProducer` writes Avro `GenericRecord`s via Confluent's `KafkaAvroSerializer` (so downstream Flink statements can deserialize) and emits OpenLineage START/COMPLETE events directly to Marquez. `OrderConsumer` uses group `ol-java-demo-consumer`, which the bridge detects via the Metrics API automatically. See [Java client demo](#java-client-end-to-end-demo). |
 | `connector-datagen-orders.json` | DatagenSource connector config for DEVTEST topology |
 | `connector-http-sink.json` | HttpSink connector config |
 | `connector-dummy-sink.json` | Minimal DummySink (used for bulk removal detection demo) |

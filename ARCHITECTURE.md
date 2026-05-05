@@ -241,6 +241,35 @@ The mapper filters on `source_type`/`target_type`. Only `"kafka_topic"` typed en
 
 Consumer groups are represented as Jobs with inputs (the topics they subscribe to) and no outputs — exactly how Marquez visualises a pure consumer. Producers are the dual: outputs only, no inputs (the producer "writes" to topics).
 
+### Confluent topology facet
+
+Every job and Kafka topic dataset emitted by the bridge carries a custom
+`confluent` facet with the topology context:
+
+```json
+{
+  "facets": {
+    "confluent": {
+      "envId":     "env-dpog0y",
+      "clusterId": "lkc-96vkp7",
+      "cloud":     "aws",
+      "region":    "us-east-2"
+    }
+  }
+}
+```
+
+Defined in `src/openlineage_confluent/mapping/facets.py` (`ConfluentJobFacet` +
+`ConfluentDatasetFacet`). Populated from `LineageEdge.{env_id, cluster_id,
+cloud, region}` which `_EnvLineageClient.build_graph()` stamps on every
+per-env edge. Lets Marquez consumers query "every job in env-X" or "every
+dataset in us-east-2" off a typed facet rather than parsing namespace strings.
+
+The facet is **omitted** for globally-scoped jobs (ksqlDB clusters,
+self-managed Connect) since they don't belong to any one CC env/cluster — the
+cluster label is the only topology identifier and it's already in the
+namespace URI.
+
 ### Diff tracking
 
 The emitter computes a fingerprint for each job's lineage:
