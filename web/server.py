@@ -1151,6 +1151,11 @@ def _lt_start_provision(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
+        # Without this, Python's stdout is block-buffered when not attached to
+        # a TTY — every `print(...)` in the teardown script accumulates until
+        # the process exits, so the user sees nothing until the very end.
+        # Matches the provision branch above (line ~1046).
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     with _lt_lock:
         _lt_state["proc"] = proc
