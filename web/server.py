@@ -210,7 +210,16 @@ def _describe_cluster(cluster_id: str, env_id: str) -> tuple[dict, str]:
 
 
 def _describe_sr(env_id: str) -> tuple[dict, str]:
-    """Schema Registry endpoint + lsrc-id for an env. Empty dict if SR not enabled."""
+    """Schema Registry endpoint + lsrc-id for an env. Empty dict if SR not enabled.
+
+    Normalises the CLI's response shape so callers can rely on `sr["id"]` and
+    `sr["endpoint"]` regardless of CLI version. Recent Confluent CLI returns
+    the cluster id under `cluster` (not `id`) and the endpoint under
+    `endpoint_url`. Older versions used `id`/`endpoint`. Without this
+    normalisation, `sr.get("id")` returns None even when SR is fully enabled,
+    and the wizard wrongly tries to enable it (which fails because the
+    `enable` subcommand was removed in recent CLI versions).
+    """
     ok, data, err = _run_confluent_json(
         ["schema-registry", "cluster", "describe",
          "--environment", env_id, "-o", "json"]
@@ -218,9 +227,12 @@ def _describe_sr(env_id: str) -> tuple[dict, str]:
     if not ok:
         # SR may simply not be enabled in this env — surface the error to caller
         return {}, err or "SR cluster describe failed"
-    if isinstance(data, dict):
-        return data, ""
-    return {}, "unexpected SR JSON shape"
+    if not isinstance(data, dict):
+        return {}, "unexpected SR JSON shape"
+    if data:
+        data["id"]       = data.get("id") or data.get("cluster") or ""
+        data["endpoint"] = data.get("endpoint") or data.get("endpoint_url") or ""
+    return data, ""
 
 
 def _list_flink_pools(env_id: str) -> tuple[list[dict], str]:
@@ -1562,17 +1574,20 @@ PAGE = """<!doctype html>
       </div>
       <div class="field-pair">
         <label>Max nodes per pipeline</label>
-        <input id="lt-max-nodes" type="number" min="2" max="20" value="4"
+        <input id="lt-max-nodes" type="number" min="3" max="21" value="5"
                style="width:100%; background:#0d1117; border:1px solid #30363d;
                       border-radius:4px; color:#c9d1d9; padding:.45rem .6rem;
                       font-size:.85rem; font-family:'SFMono-Regular',Consolas,monospace;">
       </div>
     </div>
     <div class="card-help" style="margin-top:.4rem; font-size:.8rem;">
-      Each pipeline gets a random length in [2, max nodes]. A node = a job
-      (Datagen connector / Flink statement / consumer group). One Flink
-      statement uses one CFU — keep <em>num × max</em> within your compute
-      pool's CFU budget (default 10).
+      Every pipeline is fully connected end-to-end:
+      <code>Datagen → topic → [Flink → topic]* → consumer-group</code>.
+      A node = any box in CC's stream lineage diagram (connector, topic, Flink, consumer).
+      So odd counts only — 3 nodes = no Flink, 5 nodes = 1 Flink stage,
+      7 = 2 stages, etc. Max nodes is rounded down to the largest fitting odd value.
+      Each Flink stage uses one CFU — keep <em>num × Flinks-per-pipeline</em>
+      within your compute pool's CFU budget (default 10).
     </div>
     <div class="btn-row">
       <button id="lt-start-btn"    onclick="ltStart()">Provision demo pipelines</button>

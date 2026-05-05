@@ -39,11 +39,12 @@ def test_lengths_within_bounds(script_module):
         assert 2 <= p.total_nodes <= 8, p
 
 
-def test_max_nodes_clamped_to_minimum_2(script_module):
-    """Even if caller passes max_nodes=1, generator clamps to 2 (the minimum)."""
+def test_max_nodes_clamped_to_minimum_3(script_module):
+    """Even if caller passes max_nodes=1, generator clamps to 3 (the
+    smallest end-to-end-connected pipeline: connector + topic + consumer)."""
     pipes = script_module.generate_pipelines(num_pipelines=5, max_nodes=1, seed=1)
     for p in pipes:
-        assert p.total_nodes == 2
+        assert p.total_nodes == 3
 
 
 def test_seed_makes_output_deterministic(script_module):
@@ -86,15 +87,16 @@ def test_consumer_group_set_iff_ends_with_consumer(script_module):
 
 
 def test_variety_appears_in_a_realistic_run(script_module):
-    """Across 30 pipelines: should see both consumer-ending AND flink-ending,
-    and a spread of lengths (not all identical)."""
-    pipes = script_module.generate_pipelines(num_pipelines=30, max_nodes=6, seed=11)
+    """Across 30 pipelines: every one ends with a consumer (full end-to-end
+    connectivity is required), and we should see a spread of chain lengths."""
+    # max_nodes=8 → max_flink_stages=(8-3)//2=2 → possible totals: 3, 5, 7
+    pipes = script_module.generate_pipelines(num_pipelines=30, max_nodes=8, seed=11)
     consumer_endings = sum(1 for p in pipes if p.ends_with_consumer)
-    flink_endings    = sum(1 for p in pipes if not p.ends_with_consumer)
     distinct_lengths = {p.total_nodes for p in pipes}
-    assert consumer_endings > 0
-    assert flink_endings    > 0
-    assert len(distinct_lengths) >= 3   # multiple chain lengths
+    assert consumer_endings == len(pipes), "every pipeline must end with a consumer"
+    assert len(distinct_lengths) >= 2     # at least two different chain lengths
+    # Lengths are always odd (connector + topic + 2N for Flink+topic + consumer)
+    assert all(n % 2 == 1 for n in distinct_lengths), distinct_lengths
 
 
 def test_first_flink_stage_is_enrich(script_module):

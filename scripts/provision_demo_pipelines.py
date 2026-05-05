@@ -192,30 +192,42 @@ class Pipeline:
 
     @property
     def total_nodes(self) -> int:
-        return 1 + self.flink_stages + (1 if self.ends_with_consumer else 0)
+        """Boxes in the CC stream-lineage diagram: connector + topic +
+        (Flink + topic)*N + (consumer if any). 3, 5, 7, … for end-to-end
+        connected pipelines; 2, 4, 6, … for pipelines that dangle on the
+        last topic (only happens in tests / legacy callers — production
+        always sets ends_with_consumer=True)."""
+        return 2 + 2 * self.flink_stages + (1 if self.ends_with_consumer else 0)
 
 
 def generate_pipelines(num_pipelines: int, max_nodes: int, *, seed: int | None = None) -> list[Pipeline]:
-    """Build `num_pipelines` Pipeline definitions with random varied shapes.
+    """Build `num_pipelines` Pipeline definitions, all fully connected end-to-end.
 
-    Each pipeline has:
-      - Random length in [2, max_nodes] — length 1 is excluded because a
-        Datagen-only pipeline has no consumer/Flink and is uninteresting.
-      - 60% chance of ending with a consumer group (vs another Flink stage).
-      - Round-robin domain prefix with a numeric suffix so names are unique.
+    A "node" is a box you'd see in Confluent Cloud's stream lineage diagram —
+    either a job (connector / Flink statement) OR a topic OR an end consumer.
+    Every pipeline starts with a Datagen connector and ends with a consumer
+    group, so even the smallest pipeline has 3 boxes:
+
+        connector → topic → consumer-group         (3 nodes, 0 Flink stages)
+        connector → topic → Flink → topic → cg     (5 nodes, 1 Flink stage)
+        connector → topic → Flink → topic → Flink → topic → cg  (7, 2 stages)
+        …                                                       (3 + 2N nodes)
+
+    So pipelines always have an odd node count. `max_nodes` caps the diagram
+    width; we round it down to the largest fitting odd value and then pick
+    a random length in [3, max_odd_nodes].
 
     `seed` makes the generator deterministic — used by tests.
     """
     rng = random.Random(seed)
-    max_nodes = max(2, max_nodes)
+    max_nodes = max(3, max_nodes)
+    max_flink_stages = max(0, (max_nodes - 3) // 2)
     out: list[Pipeline] = []
     for i in range(num_pipelines):
         prefix = DOMAIN_PREFIXES[i % len(DOMAIN_PREFIXES)]
         domain = f"{prefix}{i:02d}"
-        length = rng.randint(2, max_nodes)
-        ends_with_consumer = rng.random() < 0.6
-        # length = 1 (Datagen) + flink_stages + (1 if consumer else 0)
-        flink_stages = max(0, length - 1 - (1 if ends_with_consumer else 0))
+        flink_stages = rng.randint(0, max_flink_stages)
+        ends_with_consumer = True   # always — required for end-to-end connectivity
 
         pipe = Pipeline(domain=domain, flink_stages=flink_stages,
                         ends_with_consumer=ends_with_consumer)
@@ -241,7 +253,32 @@ def _flink_sql(stage_idx: int, in_topic: str, out_topic: str, rng: random.Random
     return template.format(in_=in_topic, out=out_topic)
 
 
-# ─── Schema (used only for the first Flink output; later stages SELECT *) ────
+# ─── Schemas pre-registered for each topic in the chain ─────────────────────
+# Datagen output topics get RAW_ORDERS_SCHEMA (matches the ORDERS quickstart
+# Datagen produces). Flink output topics get ENRICHED_SCHEMA (output of the
+# first enrich stage; later stages preserve schema via SELECT *). Pre-registering
+# means every topic shows up in CC's stream lineage with a schema attached
+# immediately, instead of waiting on Datagen's first produce to register.
+RAW_ORDERS_SCHEMA = json.dumps({
+    "type": "record",
+    "name": "Order",
+    "namespace": "ksql",
+    "fields": [
+        {"name": "ordertime",  "type": "long"},
+        {"name": "orderid",    "type": "int"},
+        {"name": "itemid",     "type": "string"},
+        {"name": "orderunits", "type": "double"},
+        {"name": "address",    "type": {
+            "type": "record", "name": "address",
+            "fields": [
+                {"name": "city",    "type": "string"},
+                {"name": "state",   "type": "string"},
+                {"name": "zipcode", "type": "long"},
+            ],
+        }},
+    ],
+})
+
 ENRICHED_SCHEMA = json.dumps({
     "type": "record",
     "name": "orders_enriched",
@@ -279,11 +316,15 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def sr_register(topic: str) -> bool:
+def sr_register(topic: str, schema: str) -> bool:
+    """Register `schema` as the AVRO value schema for `topic`. Skips silently
+    if SR isn't configured for this env (no endpoint/key in config.yaml)."""
+    if not (SR_ENDPOINT and SR_KEY and SR_SECRET):
+        return False
     subject = f"{topic}-value"
     url = f"{SR_ENDPOINT}/subjects/{subject}/versions"
     try:
-        r = httpx.post(url, json={"schema": ENRICHED_SCHEMA, "schemaType": "AVRO"},
+        r = httpx.post(url, json={"schema": schema, "schemaType": "AVRO"},
                        auth=(SR_KEY, SR_SECRET), timeout=30)
         if r.status_code in (200, 201):
             print(f"  SR ✓ {subject} (id={r.json().get('id')})")
@@ -453,12 +494,19 @@ def provision(num_pipelines: int, max_nodes: int, seed: int | None) -> None:
             create_topic(t, topics)
     save_state(state)
 
-    print("\n══ Step 2/6 — Register schemas for first Flink output of each chain ══")
-    for p in pipelines:
-        # Only the first Flink output topic needs explicit schema registration;
-        # later stages SELECT * which preserves the same Avro schema.
-        if p.flink_stages >= 1:
-            sr_register(p.topics[1])
+    print("\n══ Step 2/6 — Register schemas for every topic in each chain ══")
+    if not (SR_ENDPOINT and SR_KEY and SR_SECRET):
+        print("  (skipped — env has no Schema Registry credentials in config.yaml)")
+    else:
+        for p in pipelines:
+            # Datagen output topic — RAW_ORDERS_SCHEMA matches the ORDERS quickstart
+            sr_register(p.topics[0], RAW_ORDERS_SCHEMA)
+            # First Flink output (if any) gets ENRICHED_SCHEMA; later Flink
+            # stages SELECT * so the schema propagates without re-registration,
+            # but we still pre-register to make every topic show up with a
+            # schema in CC's stream lineage from the moment it's created.
+            for k, topic in enumerate(p.topics[1:], start=1):
+                sr_register(topic, ENRICHED_SCHEMA)
 
     print("\n══ Step 3/6 — Create Datagen connectors (one per pipeline) ══")
     for p in pipelines:
