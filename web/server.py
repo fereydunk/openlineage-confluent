@@ -373,6 +373,38 @@ def _upsert_environment(env_entry: dict) -> None:
     )
 
 
+def _remove_environment(env_id: str) -> bool:
+    """Remove a fully-provisioned env from confluent.environments by env_id.
+
+    Returns True if an entry was removed, False if no match. Used when the user
+    unchecks a previously-provisioned env in the wizard — the entry is dropped
+    so the next page load doesn't re-render it as ✓ provisioned. Any minted
+    Kafka/SR API keys in CC are left in place (they're just unreferenced); the
+    user can revoke them from the CC console if they want.
+    """
+    import yaml
+    if not CONFIG_YML.exists():
+        return False
+    try:
+        raw = yaml.safe_load(CONFIG_YML.read_text()) or {}
+    except yaml.YAMLError:
+        return False
+    confluent = raw.get("confluent") or {}
+    envs = confluent.get("environments") or []
+    new_envs = [e for e in envs if (e or {}).get("env_id") != env_id]
+    if len(new_envs) == len(envs):
+        return False
+    if new_envs:
+        confluent["environments"] = new_envs
+    else:
+        confluent.pop("environments", None)
+    raw["confluent"] = confluent
+    CONFIG_YML.write_text(
+        yaml.safe_dump(raw, sort_keys=False, default_flow_style=False, width=200)
+    )
+    return True
+
+
 def _read_selected_envs() -> list[dict]:
     """Return the wizard's pending selection: [{env_id, env_name}, ...].
 
@@ -2162,25 +2194,41 @@ class Handler(BaseHTTPRequestHandler):
             # Lazy: persist the selection only. Cluster + key minting happens on
             # Start OpenLineage (see _bridge_start) so the user can pick freely
             # without burning API keys or surfacing CLI errors per save.
-            already_provisioned = {e["env_id"] for e in _configured_env_ids() if not e["pending"]}
+            previously_configured = _configured_env_ids()
+            already_provisioned = {e["env_id"] for e in previously_configured if not e["pending"]}
+            previously_selected = {e["env_id"] for e in previously_configured}
             cleaned: list[dict] = []
             results: list[dict] = []
+            new_selection: set[str] = set()
             for entry in envs:
                 env_id   = (entry.get("env_id")   or "").strip()
                 env_name = (entry.get("env_name") or "").strip()
                 if not env_id:
                     results.append({"env_id": "", "ok": False, "error": "missing env_id"})
                     continue
+                new_selection.add(env_id)
                 # Don't shadow a fully-provisioned env with a pending entry.
                 if env_id not in already_provisioned:
                     cleaned.append({"env_id": env_id, "env_name": env_name})
                 results.append({"env_id": env_id, "ok": True})
+
+            # Drop envs the user just unchecked. For pending envs this happens
+            # naturally via _write_selected_envs (we only write `cleaned`). For
+            # already-provisioned envs we have to remove from confluent.environments
+            # explicitly — otherwise the next page load re-renders them as
+            # ✓ provisioned and the checkbox flips back on.
+            removed: list[str] = []
+            for env_id in previously_selected - new_selection:
+                if _remove_environment(env_id):
+                    removed.append(env_id)
 
             try:
                 _write_selected_envs(cleaned)
             except Exception as exc:    # noqa: BLE001
                 self._send_json(500, {"error": f"failed to write config.yaml: {exc}"})
                 return
+            if removed:
+                results.append({"removed": removed})
 
             self._send_json(200, {"results": results})
 

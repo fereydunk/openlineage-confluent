@@ -137,6 +137,53 @@ def test_envs_select_persists_pending_envs(server_module):
     ]
 
 
+def test_envs_select_removes_unchecked_provisioned_env(server_module):
+    """Unchecking a fully-provisioned env must drop it from
+    confluent.environments — otherwise /envs/configured re-renders it as
+    ✓ provisioned on the next page load and the checkbox flips back on."""
+    server_module.CONFIG_YML.write_text(yaml.safe_dump({
+        "confluent": {
+            "environments": [
+                {"env_id": "env-aaa", "cluster_id": "lkc-aaa",
+                 "kafka_bootstrap": "pkc-a:9092", "kafka_api_key": "Ka"},
+                {"env_id": "env-bbb", "cluster_id": "lkc-bbb",
+                 "kafka_bootstrap": "pkc-b:9092", "kafka_api_key": "Kb"},
+            ],
+        },
+    }))
+
+    # User keeps env-aaa, drops env-bbb.
+    status, _ = _post_json(
+        server_module.Handler, server_module,
+        "/envs/select",
+        {"envs": [{"env_id": "env-aaa", "env_name": "prod"}]},
+    )
+    assert status == 200
+
+    raw = yaml.safe_load(server_module.CONFIG_YML.read_text())
+    remaining_ids = [e["env_id"] for e in raw["confluent"].get("environments", [])]
+    assert remaining_ids == ["env-aaa"]
+    assert "env-bbb" not in remaining_ids
+
+
+def test_envs_select_removes_unchecked_pending_env(server_module):
+    """Unchecking a pending (selected_envs) entry must remove it too."""
+    server_module._write_selected_envs([
+        {"env_id": "env-xxx", "env_name": "kept"},
+        {"env_id": "env-yyy", "env_name": "removed"},
+    ])
+
+    status, _ = _post_json(
+        server_module.Handler, server_module,
+        "/envs/select",
+        {"envs": [{"env_id": "env-xxx", "env_name": "kept"}]},
+    )
+    assert status == 200
+
+    selected_ids = [e["env_id"] for e in server_module._read_selected_envs()]
+    assert selected_ids == ["env-xxx"]
+
+
 # ── 2. _bridge_provision_pending failure paths ────────────────────────────────
 
 def test_bridge_provision_pending_returns_true_when_no_pending(server_module):
