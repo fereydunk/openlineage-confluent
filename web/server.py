@@ -266,6 +266,68 @@ def _create_api_key(resource_id: str, env_id: str, description: str) -> tuple[di
     return {"api_key": key, "api_secret": secret}, ""
 
 
+def _probe_cloud_api_key(key: str, secret: str) -> bool:
+    """Return True if the (key, secret) pair successfully authenticates against
+    the Cloud API. We hit /iam/v2/users — cheap, requires only the basic auth
+    that any Cloud-scope key has, and 200 vs 401 is unambiguous."""
+    if not (key and secret):
+        return False
+    import base64
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        "https://api.confluent.cloud/iam/v2/users?page_size=1",
+        headers={
+            "Authorization": "Basic " + base64.b64encode(
+                f"{key}:{secret}".encode()
+            ).decode(),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as exc:
+        return exc.code == 200
+    except Exception:    # noqa: BLE001 — network/DNS/timeout — treat as broken
+        return False
+
+
+def _ensure_cloud_api_key() -> tuple[bool, str]:
+    """Make sure config.yaml has a working Cloud-scope API key.
+
+    Probes the existing key (if any) against api.confluent.cloud. If 401 or
+    no key, mints a fresh one under the logged-in user's account via
+    `confluent api-key create --resource cloud`. The minted key inherits ALL
+    the user's roles automatically — so logging in as an OrganizationAdmin
+    (the wizard's recommended setup) gives the bridge MetricsViewer and
+    CloudClusterAdmin transitively, with no separate role-binding step.
+
+    Idempotent: a working key is left untouched. Called from /cc-login so
+    every successful sign-in guarantees a usable cloud key going forward.
+    """
+    existing_key    = _read_config_value("CONFLUENT_CLOUD_API_KEY")
+    existing_secret = _read_config_value("CONFLUENT_CLOUD_API_SECRET")
+    if existing_key and existing_secret and _probe_cloud_api_key(existing_key, existing_secret):
+        return True, f"existing Cloud API key {existing_key[:8]}… works"
+
+    ok, data, err = _run_confluent_json(
+        ["api-key", "create",
+         "--resource", "cloud",
+         "--description", "openlineage-confluent (auto-minted by wizard)",
+         "-o", "json"],
+        timeout=60,
+    )
+    if not ok or not isinstance(data, dict):
+        return False, f"failed to mint Cloud API key: {err}"
+    key    = data.get("key")    or data.get("api_key")
+    secret = data.get("secret") or data.get("api_secret")
+    if not (key and secret):
+        return False, f"mint returned no key/secret: {data}"
+    _upsert_config_value("CONFLUENT_CLOUD_API_KEY",    key)
+    _upsert_config_value("CONFLUENT_CLOUD_API_SECRET", secret)
+    return True, f"minted fresh Cloud API key {key[:8]}…"
+
+
 def _provision_env(env_id: str, env_name: str) -> dict:
     """Discover cluster + SR + Flink pool for env_id and mint API keys.
 
@@ -1561,15 +1623,6 @@ PAGE = """<!doctype html>
       environment level, so the bridge will pick up <strong>all</strong> resources in
       each chosen env (Connect, Flink, ksqlDB, Tableflow, producers, consumers).
     </div>
-    <div class="card-help" style="margin-top:.5rem; padding:.5rem .65rem; background:#1a1f2e; border-left:3px solid #d29922; border-radius:3px;">
-      <strong>⚠ Cloud API key permissions:</strong> the key in <code>config.yaml</code>
-      (<code>CONFLUENT_CLOUD_API_KEY</code>) must have <strong>MetricsViewer</strong>
-      (org or env scope) and <strong>CloudClusterAdmin</strong> (or env-level
-      Connect access). Without these, producer/consumer/throughput lineage and
-      managed Connect lineage return <code>401</code> and silently drop out of
-      the graph. Grant the roles in the Confluent Cloud UI under
-      <em>Accounts &amp; access → Service accounts / Users</em>.
-    </div>
     <div class="env-list" id="env-list"></div>
     <div class="btn-row">
       <button id="env-save-btn" onclick="saveEnvs()" disabled>Save selection</button>
@@ -1725,7 +1778,12 @@ async function doLogin() {
       btn.disabled = false;
       return;
     }
-    stat.innerHTML = '<span class="ok">✓ signed in as ' + d.user + '</span>';
+    let extra = '';
+    if (d.cloud_key) {
+      const cls = d.cloud_key_ok ? 'dim' : 'err';
+      extra = ' &nbsp;·&nbsp; <span class="' + cls + '">cloud key: ' + d.cloud_key + '</span>';
+    }
+    stat.innerHTML = '<span class="ok">✓ signed in as ' + d.user + '</span>' + extra;
     setHeaderUser(d.user);
     document.getElementById('password').value = '';
     document.getElementById('env-card').classList.remove('hidden');
@@ -2265,7 +2323,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": msg[:200]})
                 return
             user = _current_user() or email
-            self._send_json(200, {"user": user})
+            # Auto-mint or refresh the Cloud-scope API key under the now-logged-
+            # in user. Inherits the user's roles (typically OrgAdmin via the
+            # wizard's recommended login → MetricsViewer + CloudClusterAdmin
+            # come along for free), so the bridge can poll Connect + Metrics
+            # without 401s. Best-effort: a failure here surfaces in the response
+            # but doesn't block sign-in (the user can still hand-edit the key).
+            ok, key_msg = _ensure_cloud_api_key()
+            self._send_json(200, {"user": user, "cloud_key": key_msg, "cloud_key_ok": ok})
 
         elif path == "/envs/select":
             envs = data.get("envs") or []
