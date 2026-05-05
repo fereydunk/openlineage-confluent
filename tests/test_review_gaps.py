@@ -378,9 +378,13 @@ def test_teardown_runs_phase_2_sweep_when_state_file_missing(provdemo_module, tm
     assert any("lcc-1" in a for a in connector_deletes)
     assert not any("lcc-2" in a for a in connector_deletes)
 
+    # Topics: phase 3 nukes EVERY non-system topic in the env (per user
+    # decision 2026-05-04 — teardown is for dedicated test envs and must
+    # leave nothing behind, including dlq-lcc-*/error-lcc-*/success-lcc-*
+    # connect-spawned topics and any other user-owned topics).
     topic_deletes = [a for a in delete_calls
                      if "kafka" in a and "topic" in a and "delete" in a]
     deleted_topics = {a[a.index("delete") + 1] for a in topic_deletes}
     assert "ol-orders00-t0" in deleted_topics
     assert "ol-orders00-t1" in deleted_topics
-    assert "user-prod-topic" not in deleted_topics
+    assert "user-prod-topic" in deleted_topics

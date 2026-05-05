@@ -1953,8 +1953,11 @@ async function ltTeardown() {
   const envLabel = (envName && envName !== env) ? envName + ' (' + env + ')' : env;
   const stat = document.getElementById('lt-status');
   if (!env) { stat.innerHTML = '<span class="err">pick an environment first</span>'; return; }
-  if (!confirm('Tear down all demo pipelines (Datagen + Flink + topics + ' +
-               'consumer groups) for env ' + envLabel + ' in Confluent Cloud?\\n\\n' +
+  if (!confirm('Tear down ALL resources in env ' + envLabel + ':\\n\\n' +
+               '  • Every ol-* connector, Flink statement, and Schema Registry subject\\n' +
+               '  • EVERY non-system Kafka topic (incl. dlq-lcc-*, error-lcc-*, success-lcc-*, ' +
+               'and any user topic in the env regardless of name)\\n' +
+               '  • All consumer worker processes started by the provisioner\\n\\n' +
                'This cannot be undone.')) return;
   const btn = document.getElementById('lt-teardown-btn');
   btn.disabled = true;

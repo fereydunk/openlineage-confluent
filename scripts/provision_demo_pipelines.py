@@ -54,6 +54,8 @@ from openlineage_confluent.config import AppConfig  # noqa: E402
 ENV_ID:          str = ""
 CLUSTER_ID:      str = ""
 FLINK_POOL:      str = ""
+FLINK_CLOUD:     str = ""    # parsed from kafka_bootstrap, e.g. "aws"
+FLINK_REGION:    str = ""    # parsed from kafka_bootstrap, e.g. "us-east-2"
 SR_ENDPOINT:     str = ""
 SR_KEY:          str = ""
 SR_SECRET:       str = ""
@@ -67,8 +69,26 @@ PIDS_FILE:  Path = SCRIPT_DIR / "demo_pipelines_consumers.pids"
 WORKER_SCRIPT = SCRIPT_DIR / "demo_pipelines_consumer_worker.py"
 
 
+def _parse_cloud_region(bootstrap: str) -> tuple[str, str]:
+    """Extract (cloud, region) from a Confluent Cloud Kafka bootstrap string.
+
+    Bootstrap format: pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
+    e.g.  pkc-921jm.us-east-2.aws.confluent.cloud:9092 → ("aws", "us-east-2")
+
+    Returns ("", "") if the bootstrap doesn't match the expected shape, in
+    which case Flink CLI calls will fall back to whatever region the user's
+    `confluent` context has selected (or fail with the original error).
+    """
+    host = bootstrap.split(":", 1)[0]   # strip port
+    parts = host.split(".")
+    # Expect at least: pkc-XXX, region, cloud, confluent, cloud
+    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
+        return parts[-3], parts[-4]
+    return "", ""
+
+
 def _load_env_creds(config_path: Path, env_id: str) -> None:
-    global ENV_ID, CLUSTER_ID, FLINK_POOL
+    global ENV_ID, CLUSTER_ID, FLINK_POOL, FLINK_CLOUD, FLINK_REGION
     global SR_ENDPOINT, SR_KEY, SR_SECRET
     global KAFKA_BOOTSTRAP, KAFKA_API_KEY, KAFKA_API_SECRET
     global STATE_FILE, PIDS_FILE
@@ -85,6 +105,7 @@ def _load_env_creds(config_path: Path, env_id: str) -> None:
     CLUSTER_ID      = env.cluster_id
     FLINK_POOL      = env.flink_compute_pool or ""
     KAFKA_BOOTSTRAP = env.kafka_bootstrap
+    FLINK_CLOUD, FLINK_REGION = _parse_cloud_region(KAFKA_BOOTSTRAP)
     KAFKA_API_KEY   = env.kafka_api_key or ""
     KAFKA_API_SECRET = (
         env.kafka_api_secret.get_secret_value() if env.kafka_api_secret else ""
@@ -499,11 +520,24 @@ def _is_demo_name(name: str) -> bool:
     return name.startswith(DEMO_NAME_PREFIX)
 
 
+def _flink_region_args() -> list[str]:
+    """Cloud/region flags required by `confluent flink statement` commands.
+
+    Returns ["--cloud", FLINK_CLOUD, "--region", FLINK_REGION] when both are
+    known, else []. Without these flags the CLI errors with "no cloud provider
+    and region selected" unless the user has set a context with `confluent
+    flink region use`.
+    """
+    if FLINK_CLOUD and FLINK_REGION:
+        return ["--cloud", FLINK_CLOUD, "--region", FLINK_REGION]
+    return []
+
+
 def _list_env_flink_statements() -> list[str]:
     """Return all Flink statement names in the current env (or [] on error)."""
     r = subprocess.run(
         ["confluent", "flink", "statement", "list",
-         "--environment", ENV_ID, "-o", "json"],
+         "--environment", ENV_ID, *_flink_region_args(), "-o", "json"],
         capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
@@ -596,7 +630,7 @@ def teardown() -> None:
     print("\n  Flink statements:")
     for stmt in state.get("flink_statements", []):
         r = run(["confluent", "flink", "statement", "delete", stmt,
-                 "--environment", ENV_ID, "--force"])
+                 "--environment", ENV_ID, *_flink_region_args(), "--force"])
         print(f"    {'✓' if ok(r) else '✗'} {stmt}")
 
     print("\n  Connectors:")
@@ -619,7 +653,7 @@ def teardown() -> None:
     for stmt in _list_env_flink_statements():
         if _is_demo_name(stmt):
             r = run(["confluent", "flink", "statement", "delete", stmt,
-                     "--environment", ENV_ID, "--force"])
+                     "--environment", ENV_ID, *_flink_region_args(), "--force"])
             print(f"    {'✓' if ok(r) else '✗'} {stmt}")
             swept += 1
     if swept == 0:
@@ -636,12 +670,12 @@ def teardown() -> None:
     if swept == 0:
         print("    (none)")
 
-    print("\n  Orphaned topics:")
+    print("\n  Orphaned topics (ol-*):")
     swept = 0
     for topic in _list_env_topics():
         if _is_demo_name(topic):
             r = run(["confluent", "kafka", "topic", "delete", topic,
-                     "--cluster", CLUSTER_ID, "--environment", ENV_ID])
+                     "--cluster", CLUSTER_ID, "--environment", ENV_ID, "--force"])
             print(f"    {'✓' if ok(r) else '✗'} {topic}")
             swept += 1
     if swept == 0:
@@ -661,8 +695,25 @@ def teardown() -> None:
     if swept == 0:
         print("    (none)")
 
+    # ── Phase 3: nuke remaining non-system topics ───────────────────────────
+    # Connect-spawned topics (dlq-lcc-*, error-lcc-*, success-lcc-*) and any
+    # other user-created topics outside the ol-* convention are caught here.
+    # The CLI's `kafka topic list` already omits system topics (`_*`,
+    # `__consumer_offsets`, `__transaction_state`, `_confluent-*`, `_schemas`),
+    # so listing + deleting everything visible is safe.
+    print("\n══ Phase 3/3 — Nuking ALL remaining non-system topics ══")
+    print("\n  Topics:")
+    swept = 0
+    for topic in _list_env_topics():
+        r = run(["confluent", "kafka", "topic", "delete", topic,
+                 "--cluster", CLUSTER_ID, "--environment", ENV_ID, "--force"])
+        print(f"    {'✓' if ok(r) else '✗'} {topic}")
+        swept += 1
+    if swept == 0:
+        print("    (none)")
+
     STATE_FILE.unlink(missing_ok=True)
-    print("\n══ Teardown complete — env is clean of ol-* demo resources ══")
+    print("\n══ Teardown complete — env is clean ══")
 
 
 # ─── Status ──────────────────────────────────────────────────────────────────
