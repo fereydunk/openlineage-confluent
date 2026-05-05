@@ -210,6 +210,15 @@ class LineageEdge(BaseModel):
     # Per-env Kafka bootstrap, used to namespace topic Datasets. None falls
     # back to OpenLineageConfig.kafka_bootstrap.
     kafka_bootstrap: str | None = None
+    # Confluent topology context — emitted as ConfluentJobFacet on jobs and
+    # ConfluentDatasetFacet on Kafka topic datasets. Lets Marquez consumers
+    # filter / group by env / cluster / region without having to parse the
+    # job namespace URI. None on globally-scoped sources (ksqlDB, self-managed
+    # Connect) where the env is irrelevant.
+    env_id:     str | None = None
+    cluster_id: str | None = None
+    cloud:      str | None = None    # "aws" | "gcp" | "azure"
+    region:     str | None = None    # e.g. "us-east-2"
 
 
 class LineageGraph(BaseModel):

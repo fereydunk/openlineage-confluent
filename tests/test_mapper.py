@@ -355,3 +355,60 @@ def test_custom_kafka_topic_facet_directly_constructible() -> None:
     assert facet.partitions == 3
     assert facet.replicationFactor == 3
     assert facet.isInternal is False
+
+
+def test_confluent_topology_facet_attached_to_jobs_and_datasets(
+    mapper, confluent_cfg, ol_cfg,
+) -> None:
+    """When LineageEdges carry env_id/cluster_id/cloud/region, both the job
+    AND its kafka_topic datasets get a ConfluentJobFacet/ConfluentDatasetFacet
+    so Marquez can filter by Confluent topology without parsing namespaces."""
+    from openlineage_confluent.confluent.models import LineageEdge
+    graph = LineageGraph(edges=[
+        LineageEdge(
+            source_name="ol-raw-orders",  source_type="kafka_topic",
+            target_name="ol-orders-enriched", target_type="kafka_topic",
+            job_name="ol-enrich-orders", job_type="flink_statement",
+            job_namespace_hint="flink://env-dpog0y",
+            kafka_bootstrap="pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+            env_id="env-dpog0y", cluster_id="lkc-96vkp7",
+            cloud="aws", region="us-east-2",
+        ),
+    ])
+    events = mapper.map_all(graph)
+    assert len(events) == 1
+    e = events[0]
+
+    job_facet = e.job.facets["confluent"]
+    assert job_facet.envId     == "env-dpog0y"
+    assert job_facet.clusterId == "lkc-96vkp7"
+    assert job_facet.cloud     == "aws"
+    assert job_facet.region    == "us-east-2"
+
+    for ds in (*e.inputs, *e.outputs):
+        ds_facet = ds.facets["confluent"]
+        assert ds_facet.envId     == "env-dpog0y"
+        assert ds_facet.clusterId == "lkc-96vkp7"
+        assert ds_facet.cloud     == "aws"
+        assert ds_facet.region    == "us-east-2"
+
+
+def test_confluent_facet_omitted_when_topology_unknown(
+    mapper, confluent_cfg, ol_cfg,
+) -> None:
+    """Globally-scoped sources (ksqlDB, self-managed Connect) leave
+    env/cluster blank — the facet should be skipped entirely rather than
+    rendered with empty fields."""
+    from openlineage_confluent.confluent.models import LineageEdge
+    graph = LineageGraph(edges=[
+        LineageEdge(
+            source_name="self-mgr-jdbc", source_type="external",
+            target_name="ol-foo", target_type="kafka_topic",
+            job_name="self-mgr-jdbc", job_type="kafka_connect_source",
+            job_namespace_hint="kafka-connect://onprem-dc1",
+        ),
+    ])
+    events = mapper.map_all(graph)
+    assert len(events) == 1
+    assert "confluent" not in (events[0].job.facets or {})
+    assert "confluent" not in (events[0].outputs[0].facets or {})

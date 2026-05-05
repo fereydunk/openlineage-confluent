@@ -62,22 +62,34 @@ log = logging.getLogger(__name__)
 _CLOUD_API = "https://api.confluent.cloud"
 
 
+def _parse_cloud_region(kafka_bootstrap: str) -> tuple[str, str]:
+    """Extract (cloud, region) from a Confluent Cloud Kafka bootstrap host.
+
+    Bootstrap format: pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
+    e.g. pkc-921jm.us-east-2.aws.confluent.cloud:9092 → ("aws", "us-east-2")
+
+    Returns ("", "") when the bootstrap doesn't match the expected shape.
+    """
+    host = (kafka_bootstrap or "").split(":", 1)[0]
+    parts = host.split(".")
+    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
+        return parts[-3], parts[-4]
+    return "", ""
+
+
 def _flink_region_args(kafka_bootstrap: str) -> list[str]:
     """Cloud/region flags required by `confluent flink statement` commands.
 
     The CLI errors with "no cloud provider and region selected" unless these
     flags are passed (or the user has set a context with `confluent flink
-    region use`). Parses both from the Kafka bootstrap host:
-      pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
-      e.g. pkc-921jm.us-east-2.aws.confluent.cloud:9092 → aws / us-east-2
+    region use`).
 
     Returns [] when the bootstrap doesn't match the expected shape, in which
     case the CLI falls back to whatever region the user's context has set.
     """
-    host = (kafka_bootstrap or "").split(":", 1)[0]
-    parts = host.split(".")
-    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
-        return ["--cloud", parts[-3], "--region", parts[-4]]
+    cloud, region = _parse_cloud_region(kafka_bootstrap)
+    if cloud and region:
+        return ["--cloud", cloud, "--region", region]
     return []
 
 
@@ -212,6 +224,10 @@ class _EnvLineageClient:
         env       = self._env.env_id
         cluster   = self._env.cluster_id
         bootstrap = self._env.kafka_bootstrap
+        # Cloud + region are derived from the Kafka bootstrap host; stamped on
+        # every LineageEdge so the mapper can attach Confluent topology
+        # facets to jobs and datasets without re-parsing.
+        cloud, region = _parse_cloud_region(bootstrap)
 
         n_workers = 6
         futures: dict[str, Any] = {}
@@ -251,6 +267,7 @@ class _EnvLineageClient:
                         job_type="kafka_connect_source",
                         job_namespace_hint=ns,
                         kafka_bootstrap=bootstrap,
+                        env_id=env, cluster_id=cluster, cloud=cloud, region=region,
                     ))
             else:  # SINK
                 for topic in conn.topics_consumed():
@@ -263,6 +280,7 @@ class _EnvLineageClient:
                         job_type="kafka_connect_sink",
                         job_namespace_hint=ns,
                         kafka_bootstrap=bootstrap,
+                        env_id=env, cluster_id=cluster, cloud=cloud, region=region,
                     ))
 
         # ── 2. Flink statements ──────────────────────────────────────────────
@@ -283,6 +301,7 @@ class _EnvLineageClient:
                         job_type="flink_statement",
                         job_namespace_hint=f"flink://{env}",
                         kafka_bootstrap=bootstrap,
+                        env_id=env, cluster_id=cluster, cloud=cloud, region=region,
                     ))
 
         # ── 3. Kafka producers (Metrics API received_bytes + client_id) ──────
@@ -297,6 +316,7 @@ class _EnvLineageClient:
                     job_type="kafka_producer",
                     job_namespace_hint=f"kafka-producer://{cluster}",
                     kafka_bootstrap=bootstrap,
+                    env_id=env, cluster_id=cluster, cloud=cloud, region=region,
                 ))
 
         # ── 4. Consumer groups (Metrics API) ─────────────────────────────────
@@ -311,6 +331,7 @@ class _EnvLineageClient:
                     job_type="kafka_consumer_group",
                     job_namespace_hint=f"kafka-consumer-group://{cluster}",
                     kafka_bootstrap=bootstrap,
+                    env_id=env, cluster_id=cluster, cloud=cloud, region=region,
                 ))
 
         # ── 5. Tableflow: Kafka topic → Iceberg dataset ──────────────────────
@@ -333,6 +354,7 @@ class _EnvLineageClient:
                 job_type="tableflow",
                 job_namespace_hint=f"tableflow://{env}",
                 kafka_bootstrap=bootstrap,
+                env_id=env, cluster_id=cluster, cloud=cloud, region=region,
             ))
 
         # ── 6. Schema Registry: schemas for every topic in graph ─────────────
@@ -484,6 +506,10 @@ class ConfluentLineageClient:
         # mapper falls back to OpenLineageConfig.kafka_bootstrap.
         for conn in sm_connectors:
             ns = f"kafka-connect://{conn.connect_cluster}"
+            # Self-managed Connect lives outside any CC env/cluster — leave
+            # env_id/cluster_id/cloud/region as None on those edges. The
+            # cluster label (conn.connect_cluster) is the only topology
+            # identifier and it's already in the namespace.
             if conn.connector_type == ConnectorType.SOURCE:
                 for topic in conn.topics_produced():
                     global_edges.append(LineageEdge(

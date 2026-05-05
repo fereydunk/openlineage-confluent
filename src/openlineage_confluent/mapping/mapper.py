@@ -36,6 +36,8 @@ from openlineage_confluent.confluent.models import LineageEdge, LineageGraph, To
 from openlineage_confluent.confluent.schema_registry_client import SchemaField, TopicSchema
 from openlineage_confluent.config import ConfluentConfig, OpenLineageConfig
 from openlineage_confluent.mapping.facets import (
+    ConfluentDatasetFacet,
+    ConfluentJobFacet,
     KafkaTopicDatasetFacet,
     KafkaTopicThroughputDatasetFacet,
 )
@@ -132,10 +134,22 @@ class ConfluentOpenLineageMapper:
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
     ) -> RunEvent:
+        # All edges in this group share the same job, so they share the same
+        # Confluent topology context (env/cluster/region). Pick the first
+        # non-empty values; missing fields render as empty strings on the facet.
+        topo = self._topology_from_edges(edges)
+        bootstrap = next(
+            (e.kafka_bootstrap for e in edges if e.kafka_bootstrap),
+            self._ol.kafka_bootstrap,
+        )
+
+        job_facets: dict = {"jobType": _job_type_facet(job_type)}
+        if any(topo.values()):
+            job_facets["confluent"] = ConfluentJobFacet(**topo)
         job = Job(
             namespace=ns_hint,
             name=job_name,
-            facets={"jobType": _job_type_facet(job_type)},
+            facets=job_facets,
         )
         run = Run(runId=_stable_run_id(ns_hint, job_name, cycle_key))
 
@@ -145,21 +159,13 @@ class ConfluentOpenLineageMapper:
         seen_inputs:  set[str] = set()
         seen_outputs: set[str] = set()
 
-        # All edges in this group share the same job, so they share the same
-        # per-env Kafka bootstrap. Pick the first non-empty value, fall back
-        # to the OL config default.
-        bootstrap = next(
-            (e.kafka_bootstrap for e in edges if e.kafka_bootstrap),
-            self._ol.kafka_bootstrap,
-        )
-
         for edge in edges:
             # Source side
             src_key = f"{edge.source_type}:{edge.source_name}"
             if src_key not in seen_inputs:
                 if edge.source_type == "kafka_topic":
                     inputs.append(self._make_input(
-                        edge.source_name, bootstrap,
+                        edge.source_name, bootstrap, topo,
                         topic_schemas, topic_metadata, topic_throughput,
                     ))
                     seen_inputs.add(src_key)
@@ -175,7 +181,7 @@ class ConfluentOpenLineageMapper:
             if tgt_key not in seen_outputs:
                 if edge.target_type == "kafka_topic":
                     outputs.append(self._make_output(
-                        edge.target_name, bootstrap,
+                        edge.target_name, bootstrap, topo,
                         topic_schemas, topic_metadata, topic_throughput,
                     ))
                     seen_outputs.add(tgt_key)
@@ -198,6 +204,22 @@ class ConfluentOpenLineageMapper:
         )
 
     # ------------------------------------------------------------------
+    # Topology helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _topology_from_edges(edges: list[LineageEdge]) -> dict:
+        """Pick the first non-empty (env_id, cluster_id, cloud, region) tuple
+        from the job's edges. All edges for one job share the same Confluent
+        topology, so the first non-empty value wins for each field."""
+        return {
+            "envId":     next((e.env_id     for e in edges if e.env_id),     "") or "",
+            "clusterId": next((e.cluster_id for e in edges if e.cluster_id), "") or "",
+            "cloud":     next((e.cloud      for e in edges if e.cloud),      "") or "",
+            "region":    next((e.region     for e in edges if e.region),     "") or "",
+        }
+
+    # ------------------------------------------------------------------
     # Dataset helpers
     # ------------------------------------------------------------------
 
@@ -205,6 +227,7 @@ class ConfluentOpenLineageMapper:
         self,
         topic: str,
         bootstrap: str,
+        topo: dict,
         topic_schemas: dict[str, TopicSchema],
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
@@ -212,13 +235,14 @@ class ConfluentOpenLineageMapper:
         return InputDataset(
             namespace=f"kafka://{bootstrap}",
             name=topic,
-            facets=self._dataset_facets(topic, topic_schemas, topic_metadata, topic_throughput),
+            facets=self._dataset_facets(topic, topo, topic_schemas, topic_metadata, topic_throughput),
         )
 
     def _make_output(
         self,
         topic: str,
         bootstrap: str,
+        topo: dict,
         topic_schemas: dict[str, TopicSchema],
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
@@ -226,7 +250,7 @@ class ConfluentOpenLineageMapper:
         return OutputDataset(
             namespace=f"kafka://{bootstrap}",
             name=topic,
-            facets=self._dataset_facets(topic, topic_schemas, topic_metadata, topic_throughput),
+            facets=self._dataset_facets(topic, topo, topic_schemas, topic_metadata, topic_throughput),
         )
 
     # ------------------------------------------------------------------
@@ -236,12 +260,18 @@ class ConfluentOpenLineageMapper:
     def _dataset_facets(
         self,
         topic: str,
+        topo: dict,
         topic_schemas: dict[str, TopicSchema],
         topic_metadata: dict[str, TopicMetadata],
         topic_throughput: dict[str, TopicThroughput],
     ) -> dict | None:
         """Return the facet dict for a topic Dataset, or None if no facets apply."""
         facets: dict = {}
+
+        # Confluent topology context — same shape as ConfluentJobFacet.
+        # Empty fields are silently passed through (consumers can ignore them).
+        if any(topo.values()):
+            facets["confluent"] = ConfluentDatasetFacet(**topo)
 
         ts = topic_schemas.get(topic)
         if ts is not None:
