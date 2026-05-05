@@ -781,7 +781,21 @@ def _parse_cloud_region_from_bootstrap(bootstrap: str) -> tuple[str, str]:
 
 
 def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
-    """Ensure env_id has Kafka cluster + SR + Flink pool; create what's missing.
+    """Ensure env_id has Kafka cluster + SR + Flink pool, ALL IN THE SAME REGION.
+
+    Schema Registry is the anchor: SR can only live in one region per env,
+    and a Flink pool / Kafka cluster in a different region from SR forces
+    every produce + Flink statement to do cross-region SR lookups (slow,
+    extra cost, and Flink can't reference cross-region topics at all).
+    So we describe SR first, take its region as the canonical one, then:
+
+      1. Find or create the Kafka cluster IN that region
+      2. Find or create the Flink compute pool IN that region
+
+    If SR isn't enabled yet, we fall back to _DEFAULT_REGION and warn the
+    user to enable SR (Cloud UI → Stream Governance) BEFORE provisioning,
+    since the Confluent CLI no longer supports `schema-registry cluster
+    enable`.
 
     Mints API keys for Kafka + SR (whether reused or freshly created) and
     persists the resulting EnvDeployment entry to config.yaml. `emit(line)`
@@ -793,23 +807,69 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
     existing = next((e for e in _configured_env_ids() if e["env_id"] == env_id), None)
     entry: dict = {"env_id": env_id, "_log": []}
 
-    # ── 1. Kafka cluster ────────────────────────────────────────────────────
+    # ── Step 0: Anchor region — describe SR first ──────────────────────────
+    emit("══ Step 0/4 — Determining canonical region (Schema Registry is the anchor) ══")
+    sr, _err = _describe_sr(env_id)
+    sr_id           = sr.get("id", "") if isinstance(sr, dict) else ""
+    sr_endpoint     = (sr.get("endpoint") or sr.get("endpoint_url") or "") if isinstance(sr, dict) else ""
+    target_cloud    = ""
+    target_region   = ""
+    if sr_endpoint:
+        sr_host = sr_endpoint.replace("https://", "").replace("http://", "")
+        target_cloud, target_region = _parse_cloud_region_from_bootstrap(sr_host + ":443")
+    if sr_id and target_region:
+        emit(f"✓ Schema Registry {sr_id} is in {target_cloud}/{target_region}")
+        emit(f"  → anchoring all components (Kafka cluster, Flink pool) to {target_cloud}/{target_region}")
+    else:
+        target_cloud, target_region = _DEFAULT_CLOUD, _DEFAULT_REGION
+        emit("⚠ No Schema Registry detected for this env.")
+        emit(f"  → falling back to {target_cloud}/{target_region} as the canonical region.")
+        emit("  Recommended: enable SR in the Confluent Cloud UI BEFORE provisioning")
+        emit("  (Environment → Stream Governance → Enable, pick the same region above)")
+        emit("  so every component shares one region. The CLI no longer supports SR enable.")
+
+    # ── Step 1: Kafka cluster IN target region ─────────────────────────────
+    emit(f"\n══ Step 1/4 — Kafka cluster in {target_cloud}/{target_region} ══")
     clusters, err = _list_clusters(env_id)
     if err:
         return False, f"kafka cluster list failed: {err}"
 
-    if clusters:
-        cluster_id = clusters[0].get("id", "")
-        emit(f"✓ Reusing existing Kafka cluster {cluster_id} ({clusters[0].get('name','')})")
+    # Filter to only clusters in the target region. Clusters in other regions
+    # are NOT reused — even if they exist — because Flink/SR alignment matters
+    # more than cluster reuse for the demo.
+    aligned_clusters: list[dict]    = []
+    misaligned_clusters: list[dict] = []
+    for c in clusters:
+        c_endpoint = (c.get("endpoint") or "").replace("SASL_SSL://", "")
+        c_cloud, c_region = _parse_cloud_region_from_bootstrap(c_endpoint)
+        if (c_cloud.lower() == target_cloud.lower()) and (c_region == target_region):
+            aligned_clusters.append(c)
+        else:
+            misaligned_clusters.append({"info": c, "cloud": c_cloud, "region": c_region})
+
+    if aligned_clusters:
+        cluster_id = aligned_clusters[0].get("id", "")
+        emit(f"✓ Reusing existing Kafka cluster {cluster_id} "
+             f"({aligned_clusters[0].get('name','')}, {target_cloud}/{target_region})")
+        if misaligned_clusters:
+            for m in misaligned_clusters:
+                emit(f"  ⚠ Ignoring misaligned cluster {m['info'].get('id','?')} "
+                     f"({m['cloud']}/{m['region']})")
     else:
-        cname = f"openlineage-{env_id[-6:]}"
+        if misaligned_clusters:
+            for m in misaligned_clusters:
+                emit(f"  ⚠ Existing cluster {m['info'].get('id','?')} is in "
+                     f"{m['cloud']}/{m['region']}, not in {target_cloud}/{target_region} — "
+                     f"can't reuse it without breaking SR/Flink region alignment.")
+            emit(f"  → Creating a new cluster in {target_cloud}/{target_region}")
+        cname = f"openlineage-{env_id[-6:]}-{target_region}"
         emit(f"… Creating Kafka cluster '{cname}' ({_DEFAULT_KAFKA_TYPE.upper()}, "
-             f"{_DEFAULT_CLOUD}/{_DEFAULT_REGION})")
+             f"{target_cloud}/{target_region})")
         ok, data, err = _run_confluent_json(
             ["kafka", "cluster", "create", cname,
              "--type",         _DEFAULT_KAFKA_TYPE,
-             "--cloud",        _DEFAULT_CLOUD,
-             "--region",       _DEFAULT_REGION,
+             "--cloud",        target_cloud,
+             "--region",       target_region,
              "--availability", "single-zone",
              "--environment",  env_id,
              "-o", "json"],
@@ -869,36 +929,13 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
         entry["kafka_api_secret"] = kkey["api_secret"]
         emit(f"  ✓ key {kkey['api_key']}")
 
-    # ── 2. Schema Registry ──────────────────────────────────────────────────
-    sr, err = _describe_sr(env_id)
-    if not sr.get("id"):
-        emit(f"… Enabling Schema Registry ({_DEFAULT_CLOUD}/{_DEFAULT_SR_GEO})")
-        ok, data, err = _run_confluent_json(
-            ["schema-registry", "cluster", "enable",
-             "--cloud", _DEFAULT_CLOUD, "--geo", _DEFAULT_SR_GEO,
-             "--environment", env_id, "-o", "json"],
-            timeout=60,
-        )
-        if not ok:
-            # The `enable` subcommand was removed from recent Confluent CLI
-            # versions — `schema-registry cluster` now exposes only `describe`
-            # and `update`. Detect that and surface a clearer instruction
-            # instead of dumping the raw "unknown flag" CLI error.
-            if "unknown flag" in err or "unknown command" in err.lower():
-                emit("⚠ The Confluent CLI no longer supports `schema-registry "
-                     "cluster enable`. Enable SR for this env via the Cloud UI: "
-                     "Environment → Stream Governance → Enable. "
-                     "The bridge runs fine without SR — only SchemaDatasetFacet "
-                     "enrichment is skipped for this env.")
-            else:
-                emit(f"⚠ SR enable failed: {err}")
-        else:
-            sr, _ = _describe_sr(env_id)
-
-    if sr.get("id"):
-        sr_id       = sr.get("id", "")
-        sr_endpoint = sr.get("endpoint") or sr.get("endpoint_url") or ""
-        emit(f"✓ Schema Registry {sr_id} at {sr_endpoint}")
+    # ── Step 2: Schema Registry API key ────────────────────────────────────
+    # SR cluster itself was already described in Step 0 to determine the
+    # canonical region. Now mint or reuse the API key the bridge will use to
+    # talk to it.
+    emit(f"\n══ Step 2/4 — Schema Registry API key ══")
+    if sr_id:
+        emit(f"✓ Schema Registry {sr_id} at {sr_endpoint} ({target_cloud}/{target_region})")
         if existing and existing.get("has_sr"):
             import yaml
             raw = yaml.safe_load(CONFIG_YML.read_text()) or {}
@@ -924,20 +961,18 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
                 }
                 emit(f"  ✓ key {sr_key['api_key']}")
     else:
-        emit("⚠ SR not available in env (skipping)")
+        emit("⚠ SR not available in env — schema-aware lineage facets will be missing.")
+        emit("  Enable SR in the Cloud UI (Environment → Stream Governance → Enable),")
+        emit(f"  pick {target_cloud}/{target_region} to match the cluster you just provisioned,")
+        emit("  then re-provision via this wizard.")
 
-    # ── 3. Flink compute pool ───────────────────────────────────────────────
+    # ── Step 3: Flink compute pool IN target region ────────────────────────
     # Flink can only reference Kafka topics in the SAME cloud+region as the
     # pool — a us-west-2 pool reading a us-east-2 cluster always errors with
-    # "Table does not exist". Derive the cluster's region from the bootstrap
-    # host and pin the Flink pool to it; reject pools in any other region as
-    # unusable.
-    target_cloud, target_region = _parse_cloud_region_from_bootstrap(bootstrap)
-    if not target_region:
-        target_cloud, target_region = _DEFAULT_CLOUD, _DEFAULT_REGION
-        emit(f"⚠ Couldn't parse region from bootstrap '{bootstrap}'; "
-             f"falling back to {target_cloud}/{target_region}")
-
+    # "Table does not exist". target_cloud/target_region was anchored on SR
+    # in Step 0 and used for the Kafka cluster in Step 1, so the pool reuses
+    # the same anchor here.
+    emit(f"\n══ Step 3/4 — Flink compute pool in {target_cloud}/{target_region} ══")
     pools, err = _list_flink_pools(env_id)
     aligned = [p for p in pools
                if (p.get("region") or "").lower() == target_region
@@ -978,9 +1013,12 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
     if pool_id:
         entry["flink_compute_pool"] = pool_id
 
-    # ── 4. Persist to config.yaml ───────────────────────────────────────────
+    # ── Step 4: Persist resolved EnvDeployment to config.yaml ──────────────
+    emit(f"\n══ Step 4/4 — Persist to config.yaml ══")
     _upsert_environment(entry)
-    emit(f"✓ Saved env {env_id} to config.yaml")
+    emit(f"✓ Saved env {env_id} to config.yaml "
+         f"(cluster={cluster_id}, pool={pool_id or '∅'}, "
+         f"sr={sr_id or '∅'}, region={target_cloud}/{target_region})")
     return True, ""
 
 
