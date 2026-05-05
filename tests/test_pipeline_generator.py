@@ -80,6 +80,29 @@ def test_uses_native_producer_is_deterministic_with_seed(script_module):
     assert [p.uses_native_producer for p in a] == [p.uses_native_producer for p in b]
 
 
+def test_fallback_flink_regions_always_included_in_sweep(script_module, monkeypatch):
+    """_all_flink_regions_to_sweep must always include the hardcoded fallback
+    AWS regions, even when there are zero pools and no cluster region — so a
+    teardown after `compute-pool delete` still catches stranded statements."""
+    # Force "no info" state: empty pool cache, empty cluster region, and
+    # compute-pool list returns empty.
+    monkeypatch.setattr(script_module, "_FLINK_POOL_REGION_CACHE", ("", ""))
+    monkeypatch.setattr(script_module, "FLINK_POOL", "")
+    monkeypatch.setattr(script_module, "FLINK_CLOUD", "")
+    monkeypatch.setattr(script_module, "FLINK_REGION", "")
+    monkeypatch.setattr(script_module, "ENV_ID", "env-test")
+
+    class FakeProc:
+        returncode = 0
+        stdout = "[]"
+    monkeypatch.setattr(script_module.subprocess, "run", lambda *a, **kw: FakeProc())
+
+    regions = script_module._all_flink_regions_to_sweep()
+    # All hardcoded fallback regions must be present
+    for fallback in script_module._FALLBACK_FLINK_REGIONS:
+        assert fallback in regions, f"missing fallback {fallback}"
+
+
 def test_seed_makes_output_deterministic(script_module):
     a = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=6, seed=42)
     b = script_module.generate_pipelines(num_pipelines=10, min_nodes=3, max_nodes=6, seed=42)

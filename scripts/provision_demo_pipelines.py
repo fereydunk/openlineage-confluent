@@ -682,13 +682,27 @@ def _is_demo_name(name: str) -> bool:
 _FLINK_POOL_REGION_CACHE: tuple[str, str] | None = None
 
 
+# When all pools have been deleted, statements in those pools' regions
+# become orphans we can't discover from `compute-pool list`. Hardcode the
+# common AWS regions Flink is offered in so the sweep still catches them.
+# Other clouds (gcp, azure) less commonly used for demos — extend if needed.
+_FALLBACK_FLINK_REGIONS: tuple[tuple[str, str], ...] = (
+    ("aws", "us-east-1"),
+    ("aws", "us-east-2"),
+    ("aws", "us-west-1"),
+    ("aws", "us-west-2"),
+    ("aws", "eu-west-1"),
+)
+
+
 def _all_flink_regions_to_sweep() -> list[tuple[str, str]]:
     """Cloud/region pairs that may contain orphan Flink statements for this env.
 
-    Includes the configured pool's region, the cluster's region (in case the
-    pool was deleted), and the regions of any other pools currently in the
-    env (catches cross-region orphans from misaligned-pool history). Sorted
-    + deduped so the sweep visits each region exactly once.
+    Includes the configured pool's region, the cluster's region, every
+    existing pool's region (catches cross-region orphans from misaligned-pool
+    history), AND a hardcoded fallback list of common AWS regions (catches
+    statements stranded after the pool that hosted them was deleted).
+    Sorted + deduped so the sweep visits each region exactly once.
     """
     regions: set[tuple[str, str]] = set()
     # Pool's region (cached after first describe)
@@ -713,6 +727,8 @@ def _all_flink_regions_to_sweep() -> list[tuple[str, str]]:
                     regions.add((cloud, region))
         except (json.JSONDecodeError, AttributeError):
             pass
+    # Fallback list — covers stranded statements when all pools have been deleted
+    regions.update(_FALLBACK_FLINK_REGIONS)
     return sorted(regions)
 
 
@@ -864,6 +880,24 @@ def teardown() -> None:
             print(f"  killed Java producer pid {pid}")
         except (ProcessLookupError, ValueError, OSError):
             pass
+    # Catch-all sweep — pkill any orphan workers whose pids we lost track of
+    # (state file deleted, machine rebooted between provision and teardown,
+    # or workers spawned by an older script version that didn't track pids).
+    # Match on full command line so we only hit OUR processes, not unrelated
+    # Java/Python apps. macOS + Linux both support `pkill -f`.
+    for pattern, label in (
+        (str(JAVA_DEMO_JAR),       "orphan Java producer"),
+        (str(WORKER_SCRIPT),       "orphan consumer worker (path-matched)"),
+        ("demo_pipelines_consumer_worker", "orphan consumer worker (name-matched)"),
+        ("demo.OrderProducer",     "orphan Java producer (class-matched)"),
+    ):
+        r = subprocess.run(["pkill", "-f", pattern], capture_output=True, text=True)
+        # pkill exit 0 = killed something, 1 = no match (both fine), 127 = pkill missing
+        if r.returncode == 0:
+            print(f"  pkilled {label} (pattern={pattern!r})")
+        elif r.returncode == 127:
+            print(f"  ⚠ pkill not in PATH — skipping orphan-process sweep")
+            break
 
     # ── Phase 1: state-tracked cleanup ──────────────────────────────────────
     print("\n══ Phase 1/2 — State-tracked cleanup ══")
