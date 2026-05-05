@@ -1566,7 +1566,7 @@ PAGE = """<!doctype html>
       Creates new test pipelines on Confluent Cloud — they'll show up in the
       lineage sync like any other workload.
     </div>
-    <div class="form-grid">
+    <div class="form-grid-3">
       <div class="field-pair" style="grid-column: 1 / -1;">
         <label>Target environment</label>
         <select id="lt-env" style="width:100%; background:#0d1117; border:1px solid #30363d;
