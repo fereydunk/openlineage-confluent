@@ -62,6 +62,25 @@ log = logging.getLogger(__name__)
 _CLOUD_API = "https://api.confluent.cloud"
 
 
+def _flink_region_args(kafka_bootstrap: str) -> list[str]:
+    """Cloud/region flags required by `confluent flink statement` commands.
+
+    The CLI errors with "no cloud provider and region selected" unless these
+    flags are passed (or the user has set a context with `confluent flink
+    region use`). Parses both from the Kafka bootstrap host:
+      pkc-XXXXXX.<region>.<cloud>.confluent.cloud:<port>
+      e.g. pkc-921jm.us-east-2.aws.confluent.cloud:9092 → aws / us-east-2
+
+    Returns [] when the bootstrap doesn't match the expected shape, in which
+    case the CLI falls back to whatever region the user's context has set.
+    """
+    host = (kafka_bootstrap or "").split(":", 1)[0]
+    parts = host.split(".")
+    if len(parts) >= 5 and parts[-2] == "confluent" and parts[-1] == "cloud":
+        return ["--cloud", parts[-3], "--region", parts[-4]]
+    return []
+
+
 class _EnvLineageClient:
     """Per-environment lineage fan-out: Connect/Flink/Metrics/Tableflow/SR/Kafka REST."""
 
@@ -154,7 +173,8 @@ class _EnvLineageClient:
         try:
             result = subprocess.run(
                 ["confluent", "flink", "statement", "list",
-                 "--environment", env, "-o", "json"],
+                 "--environment", env, *_flink_region_args(self._env.kafka_bootstrap),
+                 "-o", "json"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:

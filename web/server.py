@@ -790,7 +790,18 @@ def _ensure_env_resources(env_id: str, emit) -> tuple[bool, str]:
             timeout=60,
         )
         if not ok:
-            emit(f"⚠ SR enable failed: {err}")
+            # The `enable` subcommand was removed from recent Confluent CLI
+            # versions — `schema-registry cluster` now exposes only `describe`
+            # and `update`. Detect that and surface a clearer instruction
+            # instead of dumping the raw "unknown flag" CLI error.
+            if "unknown flag" in err or "unknown command" in err.lower():
+                emit("⚠ The Confluent CLI no longer supports `schema-registry "
+                     "cluster enable`. Enable SR for this env via the Cloud UI: "
+                     "Environment → Stream Governance → Enable. "
+                     "The bridge runs fine without SR — only SchemaDatasetFacet "
+                     "enrichment is skipped for this env.")
+            else:
+                emit(f"⚠ SR enable failed: {err}")
         else:
             sr, _ = _describe_sr(env_id)
 
