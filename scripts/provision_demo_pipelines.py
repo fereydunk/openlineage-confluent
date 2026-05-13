@@ -635,6 +635,50 @@ def start_native_producers(producer_specs: list[dict]) -> list[int]:
 
 # ─── Provision ───────────────────────────────────────────────────────────────
 
+def _reconcile_state_with_cc(state: dict) -> None:
+    """Drop state entries for resources that no longer exist in CC.
+
+    The skip-if-exists checks in provision() (topic/connector/flink) trust the
+    local state file. When CC and state drift apart — manual deletion in CC,
+    a previous teardown that nuked CC but left the state file, a CFU exhaustion
+    that quietly removed half a pipeline's Flink statements — those checks
+    silently skip recreation and leave the chain broken. Reconcile by listing
+    actual CC resources up-front and pruning anything from state that isn't
+    there. Subsequent skip-checks then act on truth.
+
+    On a CC list failure we leave the corresponding state slice untouched —
+    pruning on a transient API blip would force unnecessary re-creates.
+    """
+    actual_topics = set(_list_env_topics())
+    if actual_topics:
+        before = len(state["topics"])
+        state["topics"] = [t for t in state["topics"] if t in actual_topics]
+        dropped = before - len(state["topics"])
+        if dropped:
+            print(f"  reconcile: dropped {dropped} stale topic(s) from state")
+
+    actual_connector_ids = {cid for _, cid in _list_env_connectors() if cid}
+    if actual_connector_ids:
+        before = len(state["connectors"])
+        state["connectors"] = {
+            domain: cid for domain, cid in state["connectors"].items()
+            if cid in actual_connector_ids
+        }
+        dropped = before - len(state["connectors"])
+        if dropped:
+            print(f"  reconcile: dropped {dropped} stale connector(s) from state")
+
+    actual_statements = set(_list_env_flink_statements())
+    if actual_statements:
+        before = len(state["flink_statements"])
+        state["flink_statements"] = [
+            s for s in state["flink_statements"] if s in actual_statements
+        ]
+        dropped = before - len(state["flink_statements"])
+        if dropped:
+            print(f"  reconcile: dropped {dropped} stale Flink statement(s) from state")
+
+
 def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | None) -> None:
     pipelines = generate_pipelines(num_pipelines, min_nodes, max_nodes, seed=seed)
     rng = random.Random(seed)
@@ -655,10 +699,15 @@ def provision(num_pipelines: int, min_nodes: int, max_nodes: int, seed: int | No
     print(f"\n══ {summary_line} ══")
 
     state = load_state()
-    topics: list = state.setdefault("topics", [])
-    connectors: dict = state.setdefault("connectors", {})
-    statements: list = state.setdefault("flink_statements", [])
+    state.setdefault("topics", [])
+    state.setdefault("connectors", {})
+    state.setdefault("flink_statements", [])
     state.setdefault("producer_pids", [])
+    _reconcile_state_with_cc(state)
+    save_state(state)
+    topics: list = state["topics"]
+    connectors: dict = state["connectors"]
+    statements: list = state["flink_statements"]
 
     # Build each pipeline strictly left-to-right: every component is created
     # only after its upstream dependencies exist. The chain for a Datagen

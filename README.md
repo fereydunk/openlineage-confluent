@@ -82,31 +82,31 @@ without parsing the namespace URI:
 The `confluent` facet is **omitted** for globally-scoped jobs (ksqlDB clusters,
 self-managed Connect) since they don't belong to any one CC env/cluster.
 
-## Live demo topology (DEVTEST cluster)
+## Worked example: a 9-node pipeline
 
-The DEVTEST environment (`env-m2qxq` / `lkc-1j6rd3`, us-west-2) currently runs a minimal end-to-end orders pipeline. Every node and edge below is detected by the bridge with **zero manual emission** — the Flink statement is picked up via `confluent flink statement list`, the connectors via the Connect REST API, and the topic Datasets via Kafka REST + Schema Registry enrichment.
+A captured snapshot of one demo pipeline lives in [`examples/9-node-pipeline/`](examples/9-node-pipeline/). It contains the actual `RunEvent` JSON the bridge POSTed to Marquez for a single Datagen → 3-Flink-stage → consumer chain. Useful for:
+
+- Seeing exactly what the bridge's wire format looks like (no need to run anything)
+- Replaying into a fresh Marquez to recreate the same lineage view
+- Reference when integrating with other OL backends (DataHub, OpenMetadata)
+
+The example shape:
 
 ```
-[orders-source]               DatagenSource managed connector
-        │
-        ▼
-  orders-raw                   Kafka topic
-        │
-        ▼
-[orders-enrich]                Flink: INSERT INTO orders-enriched
-        │                              SELECT ..., CASE risk_tier ... FROM orders-raw
-        ▼
-  orders-enriched              Kafka topic
-        │                       (SchemaDatasetFacet         ← field-level schema from SR
-        │                        KafkaTopicDatasetFacet     ← partitions / replication from Kafka REST
-        │                        KafkaTopicThroughputFacet) ← bytes/records from Metrics API
-        ▼
-[orders-http-sink]             HttpSink managed connector
+[Datagen connector ol-orders00-datagen]
+    → <ol-orders00-t0>
+    → [Flink ol-orders00-enrich-0]
+    → <ol-orders00-t1>
+    → [Flink ol-orders00-filter-1]
+    → <ol-orders00-t2>
+    → [Flink ol-orders00-project-2]
+    → <ol-orders00-t3>
+    → [consumer ol-orders00-cg]
 ```
 
-A second Flink statement, `orders-enriched-ddl`, is also present (CREATE TABLE only, status `COMPLETED` — no lineage edge).
+= 1 connector + 4 Kafka topics + 3 Flink statements + 1 consumer group = **9 nodes**, single connected chain in Marquez.
 
-> **Want a richer topology?** The wizard's *Provision demo pipelines* button (card 4) generates N independent multi-stage pipelines drawn from a 20-domain pool — see [Scripts](#scripts). The standalone templates in `scripts/connector-*.json`, `scripts/flink-*.sql`, `scripts/schema-*.avsc`, and `scripts/java_client_demo/` produce a separate aspirational `ol-*` topology if you deploy them by hand.
+> **Want to generate your own?** The wizard's *Provision demo pipelines* button (card 4) generates N independent multi-stage pipelines drawn from a 20-domain pool — see [Scripts](#scripts). The standalone templates in `scripts/connector-*.json`, `scripts/flink-*.sql`, `scripts/schema-*.avsc`, and `scripts/java_client_demo/` produce a separate aspirational `ol-*` topology if you deploy them by hand.
 
 ## Prerequisites
 
@@ -304,7 +304,7 @@ When any component disappears (connector deleted, Flink statement stopped, consu
 ```json
 {
   "eventType": "ABORT",
-  "job": {"namespace": "flink://env-m2qxq", "name": "ol-high-value-alerts"},
+  "job": {"namespace": "flink://env-dpog0y", "name": "ol-orders00-enrich-0"},
   "run": {"runId": "..."}
 }
 ```
@@ -316,7 +316,7 @@ State is persisted in SQLite so removal detection works across process restarts.
 ## Development
 
 ```bash
-make test        # 237 tests, all offline — no credentials required
+make test        # 246 tests, all offline — no credentials required
 make lint        # ruff
 make type-check  # mypy
 ```
@@ -325,7 +325,7 @@ make type-check  # mypy
 
 | File | Purpose |
 |---|---|
-| `provision_demo_pipelines.py` | Provisions `--num-pipelines N` demo pipelines of `--min-nodes` to `--max-nodes` length (3, 5, 7, … always odd). Each pipeline is fully connected end-to-end and built strictly left-to-right: head topic → schema → head producer (50/50 random: Datagen connector OR native Java OrderProducer writing Avro) → wait → (Flink output topic + schema + Flink stage)\* → tail consumer. The wizard's *Provision demo pipelines* button shells out to this. `--teardown` does a three-phase delete: state-tracked, then stateless sweep of all `ol-*` resources, then nuke remaining non-system topics. Sweeps Flink statements across **all known regions** so cross-region orphans get caught. `--status` shows what's currently provisioned. `confluent-kafka` is auto-installed via the project's `pip install -e ".[dev]"`. |
+| `provision_demo_pipelines.py` | Provisions `--num-pipelines N` demo pipelines of `--min-nodes` to `--max-nodes` length (3, 5, 7, … always odd). Each pipeline is fully connected end-to-end and built strictly left-to-right: head topic → schema → head producer (50/50 random: Datagen connector OR native Java OrderProducer writing Avro) → wait → (Flink output topic + schema + Flink stage)\* → tail consumer. The wizard's *Provision demo pipelines* button shells out to this. `--teardown` does a three-phase delete: state-tracked, then stateless sweep of all `ol-*` resources, then nuke remaining non-system topics. Sweeps Flink statements across **all known regions** so cross-region orphans get caught. `--status` shows what's currently provisioned. **Reconciles local state with CC reality** at the start of every `--provision` run — drops state-file entries (topics / connectors / Flink statements) whose CC counterpart is missing, so retries after partial-failure scenarios actually re-create the missing pieces instead of silently skipping. `confluent-kafka` is auto-installed via the project's `pip install -e ".[dev]"`. |
 | `producer_consumer_demo.py` | Produces and consumes messages using a named consumer group — use to verify Metrics API consumer lineage detection |
 | `java_client_demo/` | Java Maven project showing end-to-end lineage for native Kafka Java clients. `OrderProducer` writes Avro `GenericRecord`s via Confluent's `KafkaAvroSerializer` (so downstream Flink statements can deserialize) and emits OpenLineage START/COMPLETE events directly to Marquez. `OrderConsumer` uses group `ol-java-demo-consumer`, which the bridge detects via the Metrics API automatically. See [Java client demo](#java-client-end-to-end-demo). |
 | `connector-datagen-orders.json` | DatagenSource connector config for DEVTEST topology |

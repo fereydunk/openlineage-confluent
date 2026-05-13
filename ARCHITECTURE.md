@@ -369,45 +369,47 @@ with self._lock:
 
 ## Data flow example
 
-The DEVTEST environment (`env-m2qxq` / `lkc-1j6rd3`) runs this topology — all detected by the bridge with zero manual emission:
+A captured snapshot of one demo pipeline lives in [`examples/9-node-pipeline/`](examples/9-node-pipeline/) — actual `RunEvent` JSON the bridge POSTed to Marquez, replayable into any OpenLineage backend. Pipeline shape:
 
 ```
-orders-source        →  orders-raw                         (DatagenSource managed connector)
-orders-enrich        :  orders-raw → orders-enriched       (Flink: INSERT ... SELECT ... CASE risk_tier)
-orders-http-sink     ←  orders-enriched                    (HttpSink managed connector)
+ol-orders00-datagen  →  ol-orders00-t0                                  (Datagen managed connector)
+ol-orders00-enrich-0 :  ol-orders00-t0 → ol-orders00-t1                 (Flink: schema-preserving INSERT ... SELECT)
+ol-orders00-filter-1 :  ol-orders00-t1 → ol-orders00-t2                 (Flink: same shape, optional WHERE)
+ol-orders00-project-2:  ol-orders00-t2 → ol-orders00-t3                 (Flink: same shape)
+ol-orders00-cg       ←  ol-orders00-t3                                  (consumer group, Metrics-API-detected)
 ```
 
-A second Flink statement, `orders-enriched-ddl`, exists as a CREATE TABLE (status COMPLETED, no lineage edge).
+= 1 connector + 4 topics + 3 Flink statements + 1 consumer group = 9 nodes, single connected chain in Marquez.
 
-The bridge emits 3 `RunEvent`s per cycle (one per job):
+The bridge emits 5 `RunEvent`s per cycle (one per job). Excerpts (full JSON in `examples/9-node-pipeline/events.json`):
 
 ```json
-// Source connector
+// Source connector — outputs only
 {
   "eventType": "COMPLETE",
-  "job": {"namespace": "kafka-connect://env-m2qxq", "name": "orders-source"},
+  "job": {"namespace": "kafka-connect://env-dpog0y", "name": "ol-orders00-datagen"},
   "inputs":  [],
-  "outputs": [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-raw"}]
+  "outputs": [{"namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092", "name": "ol-orders00-t0"}]
 }
 
-// Flink statement
+// Flink statement — input + output
 {
   "eventType": "COMPLETE",
-  "job": {"namespace": "flink://env-m2qxq", "name": "orders-enrich"},
-  "inputs":  [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-raw"}],
-  "outputs": [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-enriched"}]
+  "job": {"namespace": "flink://env-dpog0y", "name": "ol-orders00-enrich-0"},
+  "inputs":  [{"namespace": "kafka://...", "name": "ol-orders00-t0"}],
+  "outputs": [{"namespace": "kafka://...", "name": "ol-orders00-t1"}]
 }
 
-// Sink connector
+// Consumer group — inputs only
 {
   "eventType": "COMPLETE",
-  "job": {"namespace": "kafka-connect://env-m2qxq", "name": "orders-http-sink"},
-  "inputs":  [{"namespace": "kafka://pkc-pgq85.us-west-2.aws.confluent.cloud:9092", "name": "orders-enriched"}],
+  "job": {"namespace": "kafka-consumer-group://lkc-96vkp7", "name": "ol-orders00-cg"},
+  "inputs":  [{"namespace": "kafka://...", "name": "ol-orders00-t3"}],
   "outputs": []
 }
 ```
 
-If consumer groups, ksqlDB clusters, or Tableflow syncs are added later, additional events appear automatically — no code changes required. See the namespace conventions table earlier in this doc for the shape of those events.
+If ksqlDB clusters, Tableflow syncs, or native Java producers are added later, additional events appear automatically — no code changes required. See the namespace conventions table earlier in this doc for the shape of those events.
 
 ---
 
