@@ -1,0 +1,950 @@
+[
+  {
+    "eventType": "COMPLETE",
+    "eventTime": "2026-05-13T19:12:22.548281Z",
+    "run": {
+      "runId": "597c581e-bde7-41d5-9eb7-6977bcf0dece",
+      "facets": {
+        "nominalTime": null,
+        "parent": null,
+        "tags": {
+          "tags": [
+            {
+              "key": "openlineage_client_version",
+              "value": "1.46.0",
+              "source": "OPENLINEAGE_CLIENT"
+            }
+          ],
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/TagsRunFacet.json#/$defs/TagsRunFacet"
+        }
+      }
+    },
+    "job": {
+      "namespace": "flink://env-dpog0y",
+      "name": "ol-orders00-enrich-0",
+      "facets": {
+        "documentation": null,
+        "sourceCodeLocation": null,
+        "sql": null,
+        "jobType": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/2-0-3/JobTypeJobFacet.json#/$defs/JobTypeJobFacet",
+          "processingType": "STREAMING",
+          "integration": "FLINK",
+          "jobType": "QUERY"
+        },
+        "confluent": {
+          "cloud": "aws",
+          "envId": "env-dpog0y",
+          "region": "us-east-2",
+          "envName": "",
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "clusterId": "lkc-96vkp7",
+          "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet",
+          "clusterName": "cluster_0"
+        }
+      }
+    },
+    "inputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t0",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 82175,
+            "bytesOut": 82175,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 488,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 488,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": {},
+        "outputFacets": null
+      }
+    ],
+    "outputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t1",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 56834,
+            "bytesOut": 53189,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 495,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 465,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": null,
+        "outputFacets": {}
+      }
+    ],
+    "producer": "openlineage-confluent/0.1.0",
+    "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent"
+  },
+  {
+    "eventType": "COMPLETE",
+    "eventTime": "2026-05-13T19:12:22.548281Z",
+    "run": {
+      "runId": "550b81a5-ab6b-4d99-8357-bf2ae00f0228",
+      "facets": {
+        "nominalTime": null,
+        "parent": null,
+        "tags": {
+          "tags": [
+            {
+              "key": "openlineage_client_version",
+              "value": "1.46.0",
+              "source": "OPENLINEAGE_CLIENT"
+            }
+          ],
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/TagsRunFacet.json#/$defs/TagsRunFacet"
+        }
+      }
+    },
+    "job": {
+      "namespace": "flink://env-dpog0y",
+      "name": "ol-orders00-filter-1",
+      "facets": {
+        "documentation": null,
+        "sourceCodeLocation": null,
+        "sql": null,
+        "jobType": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/2-0-3/JobTypeJobFacet.json#/$defs/JobTypeJobFacet",
+          "processingType": "STREAMING",
+          "integration": "FLINK",
+          "jobType": "QUERY"
+        },
+        "confluent": {
+          "cloud": "aws",
+          "envId": "env-dpog0y",
+          "region": "us-east-2",
+          "envName": "",
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "clusterId": "lkc-96vkp7",
+          "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet",
+          "clusterName": "cluster_0"
+        }
+      }
+    },
+    "inputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t1",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 56834,
+            "bytesOut": 53189,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 495,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 465,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": {},
+        "outputFacets": null
+      }
+    ],
+    "outputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t2",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 26685,
+            "bytesOut": 26997,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 460,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 464,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": null,
+        "outputFacets": {}
+      }
+    ],
+    "producer": "openlineage-confluent/0.1.0",
+    "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent"
+  },
+  {
+    "eventType": "COMPLETE",
+    "eventTime": "2026-05-13T19:12:22.548281Z",
+    "run": {
+      "runId": "4ddf4e43-4db9-467f-94e8-c1330f1f118a",
+      "facets": {
+        "nominalTime": null,
+        "parent": null,
+        "tags": {
+          "tags": [
+            {
+              "key": "openlineage_client_version",
+              "value": "1.46.0",
+              "source": "OPENLINEAGE_CLIENT"
+            }
+          ],
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/TagsRunFacet.json#/$defs/TagsRunFacet"
+        }
+      }
+    },
+    "job": {
+      "namespace": "flink://env-dpog0y",
+      "name": "ol-orders00-project-2",
+      "facets": {
+        "documentation": null,
+        "sourceCodeLocation": null,
+        "sql": null,
+        "jobType": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/2-0-3/JobTypeJobFacet.json#/$defs/JobTypeJobFacet",
+          "processingType": "STREAMING",
+          "integration": "FLINK",
+          "jobType": "QUERY"
+        },
+        "confluent": {
+          "cloud": "aws",
+          "envId": "env-dpog0y",
+          "region": "us-east-2",
+          "envName": "",
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "clusterId": "lkc-96vkp7",
+          "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet",
+          "clusterName": "cluster_0"
+        }
+      }
+    },
+    "inputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t2",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 26685,
+            "bytesOut": 26997,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 460,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 464,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": {},
+        "outputFacets": null
+      }
+    ],
+    "outputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t3",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 27515,
+            "bytesOut": 20808,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 460,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 342,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": null,
+        "outputFacets": {}
+      }
+    ],
+    "producer": "openlineage-confluent/0.1.0",
+    "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent"
+  },
+  {
+    "eventType": "COMPLETE",
+    "eventTime": "2026-05-13T19:12:22.548281Z",
+    "run": {
+      "runId": "cf71b495-39ad-452e-b4b4-91618ee8f382",
+      "facets": {
+        "nominalTime": null,
+        "parent": null,
+        "tags": {
+          "tags": [
+            {
+              "key": "openlineage_client_version",
+              "value": "1.46.0",
+              "source": "OPENLINEAGE_CLIENT"
+            }
+          ],
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/TagsRunFacet.json#/$defs/TagsRunFacet"
+        }
+      }
+    },
+    "job": {
+      "namespace": "kafka-connect://env-dpog0y",
+      "name": "ol-orders00-datagen",
+      "facets": {
+        "documentation": null,
+        "sourceCodeLocation": null,
+        "sql": null,
+        "jobType": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/2-0-3/JobTypeJobFacet.json#/$defs/JobTypeJobFacet",
+          "processingType": "STREAMING",
+          "integration": "KAFKA_CONNECT",
+          "jobType": "SOURCE_CONNECTOR"
+        },
+        "confluent": {
+          "cloud": "aws",
+          "envId": "env-dpog0y",
+          "region": "us-east-2",
+          "envName": "",
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "clusterId": "lkc-96vkp7",
+          "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet",
+          "clusterName": "cluster_0"
+        }
+      }
+    },
+    "inputs": null,
+    "outputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t0",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 82175,
+            "bytesOut": 82175,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 488,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 488,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": null,
+        "outputFacets": {}
+      }
+    ],
+    "producer": "openlineage-confluent/0.1.0",
+    "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent"
+  },
+  {
+    "eventType": "COMPLETE",
+    "eventTime": "2026-05-13T19:12:22.548281Z",
+    "run": {
+      "runId": "0bc090d7-34fd-43f2-b7a0-325ef3e26387",
+      "facets": {
+        "nominalTime": null,
+        "parent": null,
+        "tags": {
+          "tags": [
+            {
+              "key": "openlineage_client_version",
+              "value": "1.46.0",
+              "source": "OPENLINEAGE_CLIENT"
+            }
+          ],
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/TagsRunFacet.json#/$defs/TagsRunFacet"
+        }
+      }
+    },
+    "job": {
+      "namespace": "kafka-consumer-group://lkc-96vkp7",
+      "name": "ol-orders00-cg",
+      "facets": {
+        "documentation": null,
+        "sourceCodeLocation": null,
+        "sql": null,
+        "jobType": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "_schemaURL": "https://openlineage.io/spec/facets/2-0-3/JobTypeJobFacet.json#/$defs/JobTypeJobFacet",
+          "processingType": "STREAMING",
+          "integration": "KAFKA",
+          "jobType": "CONSUMER_GROUP"
+        },
+        "confluent": {
+          "cloud": "aws",
+          "envId": "env-dpog0y",
+          "region": "us-east-2",
+          "envName": "",
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+          "clusterId": "lkc-96vkp7",
+          "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet",
+          "clusterName": "cluster_0"
+        }
+      }
+    },
+    "inputs": [
+      {
+        "namespace": "kafka://pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+        "name": "ol-orders00-t3",
+        "facets": {
+          "documentation": null,
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [
+              {
+                "name": "value.ordertime",
+                "type": "long",
+                "description": null
+              },
+              {
+                "name": "value.orderid",
+                "type": "int",
+                "description": null
+              },
+              {
+                "name": "value.itemid",
+                "type": "string",
+                "description": null
+              },
+              {
+                "name": "value.orderunits",
+                "type": "double",
+                "description": null
+              },
+              {
+                "name": "value.address",
+                "type": "record<address>",
+                "description": null,
+                "fields": [
+                  {
+                    "name": "city",
+                    "type": "string"
+                  },
+                  {
+                    "name": "state",
+                    "type": "string"
+                  },
+                  {
+                    "name": "zipcode",
+                    "type": "long"
+                  }
+                ]
+              }
+            ]
+          },
+          "dataSource": null,
+          "description": null,
+          "lifecycleStateChange": null,
+          "columnLineage": null,
+          "symlinks": null,
+          "confluent": {
+            "cloud": "aws",
+            "envId": "env-dpog0y",
+            "region": "us-east-2",
+            "envName": "",
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "clusterId": "lkc-96vkp7",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "clusterName": "cluster_0"
+          },
+          "kafkaTopic": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "isInternal": false,
+            "partitions": 6,
+            "replicationFactor": 3
+          },
+          "kafkaThroughput": {
+            "bytesIn": 27515,
+            "bytesOut": 20808,
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/1.46.0/client/python",
+            "recordsIn": 460,
+            "_schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet",
+            "recordsOut": 342,
+            "windowMinutes": 10
+          }
+        },
+        "inputFacets": {},
+        "outputFacets": null
+      }
+    ],
+    "outputs": null,
+    "producer": "openlineage-confluent/0.1.0",
+    "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent"
+  }
+]
