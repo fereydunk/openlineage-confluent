@@ -86,6 +86,21 @@ def test_envs_signature_changes_on_credential_rotation():
     assert _envs_signature(cfg1) != _envs_signature(cfg2)
 
 
+def test_envs_signature_changes_on_env_name_or_cluster_name_change():
+    """Renaming an env or cluster in the wizard MUST trigger a hot-reload so
+    the new envName/clusterName values reach freshly-emitted ConfluentJobFacet
+    and ConfluentDatasetFacet payloads. Without this, Marquez consumers see
+    stale labels until the bridge is restarted."""
+    base = EnvDeployment(env_id="env-a", cluster_id="lkc-a", kafka_bootstrap="b:9092",
+                         env_name="dev", cluster_name="cluster_0")
+    renamed_env = EnvDeployment(env_id="env-a", cluster_id="lkc-a", kafka_bootstrap="b:9092",
+                                env_name="staging", cluster_name="cluster_0")
+    renamed_cluster = EnvDeployment(env_id="env-a", cluster_id="lkc-a", kafka_bootstrap="b:9092",
+                                    env_name="dev", cluster_name="cluster_renamed")
+    assert _env_signature(base) != _env_signature(renamed_env)
+    assert _env_signature(base) != _env_signature(renamed_cluster)
+
+
 # ── Hot-reload behaviour ───────────────────────────────────────────────────
 
 def test_unchanged_config_does_not_rebuild_client(pipeline_with_one_env):

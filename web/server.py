@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -326,83 +327,6 @@ def _ensure_cloud_api_key() -> tuple[bool, str]:
     return True, f"minted fresh Cloud API key {key[:8]}…"
 
 
-def _provision_env(env_id: str, env_name: str) -> dict:
-    """Discover cluster + SR + Flink pool for env_id and mint API keys.
-
-    Returns a dict shaped like the EnvDeployment YAML:
-      {env_id, env_name, cluster_id, kafka_bootstrap, kafka_rest_endpoint,
-       kafka_api_key, kafka_api_secret, flink_compute_pool,
-       schema_registry: {endpoint, api_key, api_secret} | None,
-       _log: [...]}
-
-    The _log list contains human-readable progress messages for the UI.
-    """
-    log: list[str] = []
-    out: dict = {"env_id": env_id, "env_name": env_name, "_log": log}
-
-    # 1. Pick a Kafka cluster in this env (first one)
-    clusters, err = _list_clusters(env_id)
-    if err:
-        log.append(f"✗ kafka cluster list: {err}")
-        out["_error"] = err
-        return out
-    if not clusters:
-        log.append("✗ no Kafka clusters in env")
-        out["_error"] = "no Kafka clusters in env"
-        return out
-    cluster = clusters[0]
-    cluster_id = cluster.get("id", "")
-    log.append(f"✓ cluster {cluster_id} ({cluster.get('name', '')})")
-    out["cluster_id"] = cluster_id
-
-    # 2. Describe cluster → bootstrap + REST endpoint
-    desc, err = _describe_cluster(cluster_id, env_id)
-    if err:
-        log.append(f"⚠ cluster describe: {err}")
-    out["kafka_bootstrap"]     = desc.get("endpoint", "").replace("SASL_SSL://", "")
-    out["kafka_rest_endpoint"] = desc.get("rest_endpoint", "")
-    if out["kafka_bootstrap"]:
-        log.append(f"✓ bootstrap {out['kafka_bootstrap']}")
-
-    # 3. Mint Kafka cluster API key
-    kkey, err = _create_api_key(cluster_id, env_id, "openlineage-confluent")
-    if err:
-        log.append(f"✗ kafka api-key: {err}")
-        out["_error"] = err
-        return out
-    out["kafka_api_key"]    = kkey["api_key"]
-    out["kafka_api_secret"] = kkey["api_secret"]
-    log.append(f"✓ kafka API key minted ({kkey['api_key']})")
-
-    # 4. Schema Registry — optional
-    sr, err = _describe_sr(env_id)
-    if sr.get("id"):
-        sr_id = sr.get("id", "")
-        sr_endpoint = sr.get("endpoint", "") or sr.get("endpoint_url", "")
-        sr_key, err = _create_api_key(sr_id, env_id, "openlineage-confluent-sr")
-        if err:
-            log.append(f"⚠ SR api-key: {err}")
-        else:
-            out["schema_registry"] = {
-                "endpoint":   sr_endpoint,
-                "api_key":    sr_key["api_key"],
-                "api_secret": sr_key["api_secret"],
-            }
-            log.append(f"✓ SR key minted for {sr_id}")
-    else:
-        log.append("⚠ SR not enabled in env (skipping)")
-
-    # 5. Flink compute pool — best-effort, used by load-test provisioning
-    pools, err = _list_flink_pools(env_id)
-    if pools:
-        out["flink_compute_pool"] = pools[0].get("id", "")
-        log.append(f"✓ Flink pool {out['flink_compute_pool']}")
-    else:
-        log.append("⚠ no Flink compute pools (load-test will skip Flink steps)")
-
-    return out
-
-
 def _upsert_environment(env_entry: dict) -> None:
     """Add or replace an EnvDeployment entry in config.yaml's environments: list.
 
@@ -692,6 +616,64 @@ def _patched_ui_stop() -> tuple[bool, str]:
         return False, str(e)
 
 
+def _resolve_docker() -> str | None:
+    """Match the Makefile's docker resolution: prefer ~/.orbstack/bin/docker on
+    macOS, fall back to system docker on PATH. Returns the binary path, or
+    None if no docker is reachable."""
+    orbstack = Path.home() / ".orbstack" / "bin" / "docker"
+    if orbstack.exists():
+        return str(orbstack)
+    return shutil.which("docker")
+
+
+def _foreign_marquez_running() -> tuple[bool, str]:
+    """Detect a Marquez stack from a DIFFERENT docker-compose project on our
+    ports. `docker compose up -d` from this project is idempotent (re-uses
+    its own containers), so the only way to end up with two instances is if
+    someone has launched a second stack from a different project name OR a
+    non-docker process is squatting on our ports.
+
+    Returns (True, reason) when a foreign owner is detected, (False, "") when
+    the ports are free or owned by THIS project's containers.
+    """
+    # Inventory containers labeled by docker-compose. The label
+    # `com.docker.compose.project` carries the project name; ours is
+    # "openlineage-confluent" (matches the parent dir of docker-compose.yml).
+    docker = _resolve_docker()
+    if docker is None:    # no docker reachable — nothing we can detect
+        return False, ""
+    try:
+        r = subprocess.run(
+            [docker, "ps", "--format", "{{.Names}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, ""    # docker not reachable — not our problem to police
+    if r.returncode != 0:
+        # Daemon down or permission denied — log so the user knows the safety
+        # check was bypassed instead of silently allowing a foreign stack to
+        # collide with ours.
+        print(f"  ⚠ _foreign_marquez_running: `docker ps` rc={r.returncode}: "
+              f"{(r.stderr or '').strip()[:120]} — skipping foreign-stack check")
+        return False, ""
+
+    our_project = REPO_DIR.name    # "openlineage-confluent"
+    foreign: list[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        name, project, ports = parts
+        # Only flag containers exposing one of our ports
+        if not any(f":{p}->" in ports for p in ("5000", "5001", "3000", "5432")):
+            continue
+        if project != our_project:
+            foreign.append(f"{name} (project={project!r}, ports={ports[:60]})")
+    if foreign:
+        return True, "; ".join(foreign)
+    return False, ""
+
+
 def _marquez_action(action: str) -> tuple[int, str]:
     """Bring the FULL Marquez stack up, down, or wipe-and-restart.
 
@@ -700,9 +682,22 @@ def _marquez_action(action: str) -> tuple[int, str]:
     down:  docker compose down + kill the patched UI dev server
     wipe:  docker compose down -v + up -d (drops the postgres volume —
            every namespace/dataset/job/run is gone) + bounce the patched UI
+
+    On `up`/`wipe`, refuses if a Marquez stack from a different docker-compose
+    project is already squatting on our ports (5000/5001/3000/5432) — would
+    silently double-bind otherwise and the user sees one stack while writing
+    to another.
     """
     if action not in ("up", "down", "wipe"):
         return 2, f"unknown action: {action}"
+    if action in ("up", "wipe"):
+        foreign, detail = _foreign_marquez_running()
+        if foreign:
+            return 1, (
+                "Refusing to start Marquez — another docker-compose project "
+                "is already running containers on our ports:\n  " + detail +
+                "\nStop that stack first (or rename this project's compose file)."
+            )
     target = {"up": "marquez-up", "down": "marquez-down", "wipe": "marquez-wipe"}[action]
     parts: list[str] = []
 
@@ -1276,9 +1271,16 @@ def _bridge_pump(proc: subprocess.Popen) -> None:
 def _bridge_provision_pending() -> bool:
     """Provision every env in selected_envs; move successes into environments.
 
-    Streams progress lines into the bridge log. Returns True if all selected
-    envs were provisioned (or there were none to begin with), False on the
-    first failure.
+    Delegates to _ensure_env_resources — the same SR-anchored 4-step flow card
+    4 uses — so the Start OpenLineage path produces region-aligned Kafka cluster
+    + SR + Flink pool. Without this, an env whose existing cluster is in a
+    different region from SR would silently land in config.yaml and every
+    Flink statement would later fail with "Table does not exist".
+
+    _ensure_env_resources persists the env to config.yaml itself and streams
+    progress via the emit callback, so this function is just an outer loop +
+    selected_envs bookkeeping. Returns True if all selected envs were
+    provisioned (or there were none to begin with), False on the first failure.
     """
     pending = _read_selected_envs()
     if not pending:
@@ -1289,26 +1291,19 @@ def _bridge_provision_pending() -> bool:
     for entry in pending:
         env_id   = entry["env_id"]
         env_name = entry.get("env_name", "")
-        _bridge_emit(f"  → {env_id} ({env_name or 'no name'}): minting Kafka + SR keys")
+        _bridge_emit(f"  → {env_id} ({env_name or 'no name'}): SR-anchored provisioning…")
         try:
-            cfg_entry = _provision_env(env_id, env_name)
+            ok, err = _ensure_env_resources(env_id, _bridge_emit)
         except Exception as exc:    # noqa: BLE001
             _bridge_emit(f"  ✗ {env_id}: uncaught {exc}")
             return False
-        for log_line in cfg_entry.get("_log", []):
-            _bridge_emit(f"    {log_line}")
-        if cfg_entry.get("_error"):
-            _bridge_emit(f"  ✗ {env_id}: {cfg_entry['_error']}")
+        if not ok:
+            _bridge_emit(f"  ✗ {env_id}: {err}")
             # Persist any progress made so far (move successes out, keep failures pending)
             _write_selected_envs(remaining)
             return False
-        try:
-            _upsert_environment(cfg_entry)
-        except Exception as exc:    # noqa: BLE001
-            _bridge_emit(f"  ✗ {env_id}: failed to write config.yaml: {exc}")
-            _write_selected_envs(remaining)
-            return False
-        # Success: drop this env from the still-pending list
+        # Success: _ensure_env_resources already wrote config.yaml. Drop this
+        # env from the still-pending list.
         remaining = [r for r in remaining if r["env_id"] != env_id]
         _write_selected_envs(remaining)
         _bridge_emit(f"  ✓ {env_id}: provisioned")
@@ -2554,9 +2549,46 @@ def _kill_orphan_bridges() -> None:
         print(f"  Killed orphan bridge process(es) matching {pattern!r}")
 
 
+def _auto_start_bridge_if_envs_configured() -> None:
+    """Auto-spawn `ol-confluent run` on wizard launch when config.yaml has
+    already-provisioned envs AND Marquez is actually reachable.
+
+    Background: _bridge_state lives in-memory only. Every wizard restart
+    forgets its previous bridge subprocess, the orphan-kill above takes
+    care of those, but the user is then left with no bridge running and
+    has to remember to click "Start OpenLineage" on card 3. Auto-starting
+    closes that gap so a wizard restart leaves lineage flowing without
+    any manual step.
+
+    Skip if no env is provisioned yet (first-time setup) — the user
+    needs to walk through the cards anyway. Skip if Marquez API is not
+    responding — otherwise the bridge would emit to a dead :5000 in a
+    tight loop and burn CC API quota. Skip silently on any error so a
+    bad config never prevents the wizard itself from starting.
+    """
+    try:
+        provisioned = [e for e in _configured_env_ids() if not e["pending"]]
+        if not provisioned:
+            print("  No provisioned envs in config.yaml — skip bridge auto-start.")
+            return
+        if not _marquez_status().get("api_running"):
+            print("  Marquez API not reachable on :5000 — skip bridge auto-start "
+                  "(start Marquez via card 1 then click 'Start OpenLineage').")
+            return
+        ok, msg = _bridge_start()
+        marker = "✓" if ok else "⚠"
+        print(f"  {marker} Auto-started bridge: {msg}")
+        if ok:
+            env_ids = ", ".join(e["env_id"] for e in provisioned)
+            print(f"    Polling envs: {env_ids}")
+    except Exception as exc:    # noqa: BLE001 — wizard must keep starting
+        print(f"  ⚠ Auto-start bridge failed (continuing anyway): {exc}")
+
+
 def main() -> None:
     _kill_orphan_bridges()
     print(f"OpenLineage-Confluent setup wizard → http://localhost:{PORT}")
+    _auto_start_bridge_if_envs_configured()
     print("Press Ctrl-C to stop.")
     try:
         ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

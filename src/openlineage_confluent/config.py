@@ -59,9 +59,9 @@ class EnvDeployment(BaseModel):
     kafka_bootstrap: str                  # pkc-xxx.<region>.aws.confluent.cloud:9092
 
     # Human-readable names. Optional; populated by the wizard during
-    # _provision_env. The bridge surfaces both ID and name on the Confluent
-    # topology facet so Marquez consumers can show "test-lineage" instead of
-    # the opaque "env-dpog0y" in the UI.
+    # _ensure_env_resources. The bridge surfaces both ID and name on the
+    # Confluent topology facet so Marquez consumers can show "test-lineage"
+    # instead of the opaque "env-dpog0y" in the UI.
     env_name:     str | None = None       # e.g. "test-lineage"
     cluster_name: str | None = None       # e.g. "cluster_0"
 

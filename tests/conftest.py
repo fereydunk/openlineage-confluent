@@ -18,8 +18,13 @@ from openlineage_confluent.confluent.models import (
 # ── Config fixtures ────────────────────────────────────────────────────────────
 
 def _make_env(env_id: str = "env-abc123", cluster_id: str = "lkc-abc123",
-              bootstrap: str = "pkc-abc123.us-east-2.aws.confluent.cloud:9092") -> EnvDeployment:
-    return EnvDeployment(env_id=env_id, cluster_id=cluster_id, kafka_bootstrap=bootstrap)
+              bootstrap: str = "pkc-abc123.us-east-2.aws.confluent.cloud:9092",
+              env_name: str = "test-env", cluster_name: str = "cluster_0") -> EnvDeployment:
+    return EnvDeployment(
+        env_id=env_id, env_name=env_name,
+        cluster_id=cluster_id, cluster_name=cluster_name,
+        kafka_bootstrap=bootstrap,
+    )
 
 
 @pytest.fixture()

@@ -2,8 +2,8 @@
 
 Five focused areas:
   1. /envs/select HTTP handler — dedup branch + auth gate
-  2. _bridge_provision_pending — failure paths (provision returns _error,
-     _upsert_environment raises, uncaught exception in _provision_env)
+  2. _bridge_provision_pending — failure paths (_ensure_env_resources
+     returns False, raises mid-write, raises uncaught)
   3. ConfluentLineageClient.get_lineage_graph — global ksqlDB and
      self-managed-Connect failures land in graph.failed_namespaces
   4. _envs_signature — Schema Registry credential rotation triggers a
@@ -196,14 +196,12 @@ def test_bridge_provision_pending_aborts_on_provision_error(server_module):
         {"env_id": "env-bbb", "env_name": "stg"},
     ])
 
-    def fake_provision(env_id, env_name):
+    def fake_ensure(env_id, emit):
         if env_id == "env-aaa":
-            return {"env_id": env_id, "_log": ["x"], "_error": "no clusters in env"}
-        return {"env_id": env_id, "_log": [], "cluster_id": "lkc-x",
-                "kafka_bootstrap": "pkc:9092", "kafka_api_key": "K",
-                "kafka_api_secret": "S"}
+            return False, "no clusters in env"
+        return True, ""
 
-    with patch.object(server_module, "_provision_env", side_effect=fake_provision):
+    with patch.object(server_module, "_ensure_env_resources", side_effect=fake_ensure):
         ok = server_module._bridge_provision_pending()
 
     assert ok is False
@@ -214,14 +212,12 @@ def test_bridge_provision_pending_aborts_on_provision_error(server_module):
 
 
 def test_bridge_provision_pending_aborts_on_upsert_failure(server_module):
+    """If _ensure_env_resources crashes (e.g. its internal _upsert_environment
+    call hits a disk-full PermissionError), _bridge_provision_pending must
+    treat it as a failure and leave selected_envs untouched."""
     server_module._write_selected_envs([{"env_id": "env-aaa", "env_name": "prod"}])
 
-    good_entry = {"env_id": "env-aaa", "_log": [], "cluster_id": "lkc-x",
-                  "kafka_bootstrap": "pkc:9092", "kafka_api_key": "K",
-                  "kafka_api_secret": "S"}
-
-    with patch.object(server_module, "_provision_env", return_value=good_entry), \
-         patch.object(server_module, "_upsert_environment",
+    with patch.object(server_module, "_ensure_env_resources",
                       side_effect=PermissionError("disk full")):
         ok = server_module._bridge_provision_pending()
 
@@ -233,7 +229,7 @@ def test_bridge_provision_pending_aborts_on_upsert_failure(server_module):
 def test_bridge_provision_pending_handles_uncaught_exception(server_module):
     server_module._write_selected_envs([{"env_id": "env-aaa", "env_name": "prod"}])
 
-    with patch.object(server_module, "_provision_env",
+    with patch.object(server_module, "_ensure_env_resources",
                       side_effect=RuntimeError("CLI vanished")):
         ok = server_module._bridge_provision_pending()
 
@@ -246,12 +242,17 @@ def test_bridge_provision_pending_succeeds_for_all_envs(server_module):
         {"env_id": "env-bbb", "env_name": "stg"},
     ])
 
-    def fake_provision(env_id, env_name):
-        return {"env_id": env_id, "_log": [], "cluster_id": f"lkc-{env_id[-3:]}",
-                "kafka_bootstrap": "pkc:9092", "kafka_api_key": "K",
-                "kafka_api_secret": "S"}
+    # _ensure_env_resources persists the env to config.yaml itself, so the
+    # fake has to mirror that side-effect for the assertion below to hold.
+    def fake_ensure(env_id, emit):
+        server_module._upsert_environment({
+            "env_id": env_id, "cluster_id": f"lkc-{env_id[-3:]}",
+            "kafka_bootstrap": "pkc:9092", "kafka_api_key": "K",
+            "kafka_api_secret": "S",
+        })
+        return True, ""
 
-    with patch.object(server_module, "_provision_env", side_effect=fake_provision):
+    with patch.object(server_module, "_ensure_env_resources", side_effect=fake_ensure):
         ok = server_module._bridge_provision_pending()
 
     assert ok is True

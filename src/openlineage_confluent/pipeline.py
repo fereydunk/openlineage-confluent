@@ -34,7 +34,9 @@ def _env_signature(env: EnvDeployment) -> tuple:
         )
     return (
         env.env_id,
+        env.env_name,
         env.cluster_id,
+        env.cluster_name,
         env.kafka_bootstrap,
         env.flink_compute_pool,
         env.kafka_rest_endpoint,
@@ -106,7 +108,7 @@ class LineagePipeline:
         log.info(
             "Hot-reload: env list changed — added=%s removed=%s rotated=%s",
             sorted(added), sorted(removed),
-            sorted(rotated) if (added or removed) is False else "(see added/removed)",
+            sorted(rotated) if not (added or removed) else "(see added/removed)",
         )
 
         self._client.close()
